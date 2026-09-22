@@ -1,0 +1,20 @@
+# Core Audio & Speech-to-Text
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+SoundCard>=0.4.2
+numpy>=1.24.0
+
+# LLM APIs (Groq & NVIDIA NIM OpenAI-compatible endpoints)
+openai>=1.12.0
+
+# Windows System Integration & Audio Loopback
+pywin32>=306
+keyboard>=0.13.5
+
+# Document Ingestion (Optional PDF Support)
+pypdf>=3.17.0
+
+# Optional CUDA 12 GPU Acceleration (for local faster-whisper on NVIDIA GPU)
+# ctranslate2>=4.0.0
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
