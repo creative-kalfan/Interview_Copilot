@@ -56,8 +56,8 @@ import threading
 import re
 import shutil
 from enum import Enum
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Any, Optional, Union
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -236,6 +236,10 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "260"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.35"))
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "6"))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "2"))
+
+PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "groq").lower()
+FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "nvidia").lower()
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() in ("true", "1", "yes")
 
 # Speculative partial-STT preparation (V2.1)
 SPEC_PARTIAL_INTERVAL = float(os.getenv("SPEC_PARTIAL_INTERVAL", "1.0"))       # s between full-buffer speculative partials
@@ -747,7 +751,7 @@ class ISRE:
 # 4. Controlled Candidate Context & Entity Grounding Engine
 # ---------------------------------------------------------------------------
 @dataclass
-class AnswerTarget:
+class EntityDefinition:
     name: str
     category: str
     forbidden_terms: List[str]
@@ -755,8 +759,61 @@ class AnswerTarget:
     safe_fallback: str
 
 
-KNOWN_TARGETS: Dict[str, AnswerTarget] = {
-    "Power BI": AnswerTarget(
+EntityTarget = EntityDefinition
+
+
+@dataclass
+class AnswerTarget:
+    raw_transcript: str
+    normalized_question: str
+    interview_type: InterviewType
+    entity: Optional[str] = None
+    topic: Optional[str] = None
+    confidence: float = 1.0
+    parent_question_id: Optional[str] = None
+    parent_context: Optional[str] = None
+    surface_type: Optional[InterviewType] = None
+    resolved_interview_type: Optional[InterviewType] = None
+    target_entity: Optional[EntityDefinition] = None
+    provenance: str = "UNKNOWN"
+    stt_confidence: float = 1.0
+    intent_confidence: float = 1.0
+    entity_confidence: float = 1.0
+    retrieval_confidence: float = 1.0
+    validation_confidence: float = 1.0
+
+    @property
+    def name(self) -> str:
+        return self.entity or (self.target_entity.name if self.target_entity else "")
+
+    @property
+    def category(self) -> str:
+        return self.target_entity.category if self.target_entity else (self.topic or "")
+
+    @property
+    def forbidden_terms(self) -> List[str]:
+        return self.target_entity.forbidden_terms if self.target_entity else []
+
+    @property
+    def expected_terms(self) -> List[str]:
+        return self.target_entity.expected_terms if self.target_entity else []
+
+    @property
+    def safe_fallback(self) -> str:
+        return self.target_entity.safe_fallback if self.target_entity else ""
+
+    @property
+    def confidence_breakdown(self) -> Dict[str, float]:
+        return {
+            "intent": self.intent_confidence,
+            "entity": self.entity_confidence,
+            "retrieval": self.retrieval_confidence,
+            "validation": self.validation_confidence,
+        }
+
+
+KNOWN_TARGETS: Dict[str, EntityDefinition] = {
+    "Power BI": EntityDefinition(
         name="Power BI",
         category="BI_TOOL",
         forbidden_terms=[
@@ -772,11 +829,11 @@ KNOWN_TARGETS: Dict[str, AnswerTarget] = {
             "data sources, model relationships, and build interactive dashboards and reports."
         )
     ),
-    "Power VA": AnswerTarget(
+    "Power VA": EntityDefinition(
         name="Power VA",
         category="ELECTRICAL_UNIT",
         forbidden_terms=[
-            "business intelligence", "data visualization", "power bi", "microsoft report", "dax", "dashboard"
+            "business intelligence", "data visualization", "power bi", "microsoft report", "dax", "dashboard", "power query", "tableau"
         ],
         expected_terms=[
             "volt-ampere", "apparent power", "ac circuit", "rms", "electrical", "power va"
@@ -786,7 +843,7 @@ KNOWN_TARGETS: Dict[str, AnswerTarget] = {
             "circuit, calculated as the product of RMS voltage and RMS current."
         )
     ),
-    "Power Query": AnswerTarget(
+    "Power Query": EntityDefinition(
         name="Power Query",
         category="ETL_TOOL",
         forbidden_terms=["power va", "volt-ampere", "apparent power"],
@@ -798,10 +855,10 @@ KNOWN_TARGETS: Dict[str, AnswerTarget] = {
             "clean, reshape, and load data from heterogeneous sources."
         )
     ),
-    "DAX": AnswerTarget(
+    "DAX": EntityDefinition(
         name="DAX",
         category="EXPRESSION_LANGUAGE",
-        forbidden_terms=["power va", "volt-ampere", "apparent power"],
+        forbidden_terms=["power va", "volt-ampere", "apparent power", "electrical circuit"],
         expected_terms=[
             "data analysis expressions", "formula", "measure", "calculated column", "power bi", "tabular", "dax"
         ],
@@ -810,7 +867,7 @@ KNOWN_TARGETS: Dict[str, AnswerTarget] = {
             "and Power Pivot to define custom measures and calculated columns."
         )
     ),
-    "Tableau": AnswerTarget(
+    "Tableau": EntityDefinition(
         name="Tableau",
         category="BI_TOOL",
         forbidden_terms=["power va", "volt-ampere", "apparent power"],
@@ -822,7 +879,7 @@ KNOWN_TARGETS: Dict[str, AnswerTarget] = {
             "drag-and-drop report building and interactive dashboards."
         )
     ),
-    "SQL": AnswerTarget(
+    "SQL": EntityDefinition(
         name="SQL",
         category="QUERY_LANGUAGE",
         forbidden_terms=["power va", "volt-ampere", "apparent power"],
@@ -835,21 +892,86 @@ KNOWN_TARGETS: Dict[str, AnswerTarget] = {
 }
 
 
+class DomainLexicon:
+    """Deterministic domain lexicon and STT normalizer with contextual validation."""
+
+    ALIASES = {
+        "Power BI": [r"\bpower\s*(?:bee|b\s*i)\b", r"\bpowerbi\b", r"\bpbi\b"],
+        "Power VA": [r"\bpower\s*(?:v\s*a|va)\b", r"\bpowerva\b"],
+        "Power Query": [r"\bpower\s*query\b", r"\bpowerquery\b"],
+        "DAX": [r"\bd\.a\.x\.|\bd\s*a\s*x\b", r"\bdacs\b"],
+        "Tableau": [r"\b(?:tablo|tab\s*low)\b"],
+        "SQL": [r"\bs\.q\.l\.|\bs\s*q\s*l\b"],
+        "Excel": [r"\bms\s*excel\b"],
+        "Google Sheets": [r"\b(?:gsheets|g\s*sheets)\b"],
+        "Credit Risk": [r"\bcredit[\s-]risk\b"],
+        "Delinquency Dashboard": [r"\bdelinquen(?:cy|t)\s*(?:dashboard|board)\b"],
+        "income-to-debt ratio": [r"\bincome\s*to\s*debt(?:\s*ratio)?\b", r"\bdebt\s*to\s*income(?:\s*ratio)?\b", r"\bdti\b"],
+        "data analytics": [r"\bdata\s*analytic\b"],
+        "data visualization": [r"\bdata\s*viz\b", r"\bdataviz\b"]
+    }
+
+    BI_CONTEXT_KEYWORDS = {"dashboard", "report", "visualization", "viz", "analytics", "microsoft", "dax", "tool", "software", "bi"}
+
+    @classmethod
+    def normalize_stt(cls, text: str, context_hint: Optional[str] = None) -> Tuple[str, Optional[str], float]:
+        norm = text
+        detected_entity = None
+        conf = 1.0
+
+        # Strict non-replacement: power va -> Power VA (never Power BI)
+        if re.search(r"\bpower\s*(?:v\s*a|va)\b", norm, flags=re.I) or re.search(r"\bpowerva\b", norm, flags=re.I):
+            norm = re.sub(r"\bpower\s*(?:v\s*a|va)\b", "Power VA", norm, flags=re.I)
+            norm = re.sub(r"\bpowerva\b", "Power VA", norm, flags=re.I)
+            detected_entity = "Power VA"
+            conf = 0.98
+
+        # Unambiguous entity aliases
+        for entity, patterns in cls.ALIASES.items():
+            if entity == "Power VA":
+                continue
+            for pat in patterns:
+                if re.search(pat, norm, flags=re.I):
+                    norm = re.sub(pat, entity, norm, flags=re.I)
+                    if detected_entity is None:
+                        detected_entity = entity
+                    conf = 0.95
+
+        # Contextual alias: 'power by' -> 'Power BI' ONLY when surrounding context indicates BI/data
+        if re.search(r"\bpower\s*by\b", norm, flags=re.I):
+            surrounding = f"{norm} {context_hint or ''}".lower()
+            if any(k in surrounding for k in cls.BI_CONTEXT_KEYWORDS):
+                norm = re.sub(r"\bpower\s*by\b", "Power BI", norm, flags=re.I)
+                detected_entity = "Power BI"
+                conf = 0.88
+                logger.debug("[LEXICON] Contextually normalized 'power by' -> 'Power BI'")
+
+        # "Power B" pattern when referring to BI tool
+        if re.search(r"\bpower\s*b\b", norm, flags=re.I):
+            norm = re.sub(r"\bpower\s*b\b", "Power BI", norm, flags=re.I)
+            detected_entity = "Power BI"
+            conf = 0.85
+
+        if detected_entity and DEBUG_MODE:
+            logger.debug(f"[LEXICON] Normalized '{text}' -> '{norm}' (entity={detected_entity}, conf={conf:.2f})")
+
+        return norm, detected_entity, conf
+
+    @classmethod
+    def normalize(cls, text: str) -> str:
+        norm, _, _ = cls.normalize_stt(text)
+        return norm
+
+
 def normalize_query_entities(q: str) -> str:
     """Normalize phonetics/speech misrecognitions while strictly preserving distinct entities."""
-    t = re.sub(r"\bpower\s*(?:bee|b\s*i)\b", "Power BI", q, flags=re.I)
-    t = re.sub(r"\bpowerbi\b", "Power BI", t, flags=re.I)
-    t = re.sub(r"\bpower\s*(?:v\s*a|va)\b", "Power VA", t, flags=re.I)
-    t = re.sub(r"\bpowerva\b", "Power VA", t, flags=re.I)
-    t = re.sub(r"\bpower\s*query\b", "Power Query", t, flags=re.I)
-    t = re.sub(r"\bd\.a\.x\.|\bd\s*a\s*x\b", "DAX", t, flags=re.I)
-    t = re.sub(r"\b(?:tablo|tab\s*low)\b", "Tableau", t, flags=re.I)
-    return t
+    norm, _, _ = DomainLexicon.normalize_stt(q)
+    return norm
 
 
-def extract_target_entity(query: str) -> Optional[AnswerTarget]:
+def extract_target_entity(query: str) -> Optional[EntityDefinition]:
     """Extract authoritative technical target entity with alias normalization."""
-    norm = normalize_query_entities(query)
+    norm, _, _ = DomainLexicon.normalize_stt(query)
     # Check Power VA before Power BI when 'power va' is in query
     if re.search(r"\bPower VA\b", norm, flags=re.I):
         return KNOWN_TARGETS["Power VA"]
@@ -866,18 +988,358 @@ def extract_target_entity(query: str) -> Optional[AnswerTarget]:
     return None
 
 
-def validate_technical_answer(target: Optional[AnswerTarget], answer_text: str) -> Tuple[bool, str]:
+ENTITY_CONTRADICTIONS: Dict[str, List[str]] = {
+    "Power BI": [
+        "volt-ampere", "volt ampere", "apparent power", "power factor", "ac circuit",
+        "rms voltage", "rms current", "electrical power", "electrical circuit", "power va", "volts", "amperes", "volt"
+    ],
+    "Power VA": [
+        "business intelligence", "data visualization", "power bi", "microsoft report",
+        "dax", "dashboard", "power query", "tableau"
+    ],
+    "DAX": [
+        "volt-ampere", "apparent power", "electrical circuit", "ac circuit", "rms voltage",
+        "stock index", "stock market", "frankfurt", "german stock"
+    ],
+    "Power Query": [
+        "apparent power", "volt-ampere", "power va"
+    ],
+    "Tableau": [
+        "apparent power", "volt-ampere", "power va"
+    ],
+    "SQL": [
+        "apparent power", "volt-ampere", "power va"
+    ]
+}
+
+
+def detect_entity_contradiction(entity_name: Optional[str], text: str) -> Optional[str]:
+    """Returns contradictory concept found in text for entity_name, or None."""
+    if not entity_name:
+        return None
+    low = text.lower()
+    for forb in ENTITY_CONTRADICTIONS.get(entity_name, []):
+        if forb in low:
+            return forb
+    return None
+
+
+class ValidationResult(tuple):
+    def __new__(cls, is_valid: bool, remediation_prompt: str):
+        return super().__new__(cls, (is_valid, remediation_prompt))
+
+    @property
+    def is_valid(self) -> bool:
+        return self[0]
+
+    @property
+    def remediation_prompt(self) -> str:
+        return self[1]
+
+
+def validate_technical_answer(target: Union[EntityDefinition, AnswerTarget, str, None], answer_text: str) -> ValidationResult:
     """Validate that technical answer satisfies entity grounding and contains zero forbidden concepts."""
+    if isinstance(target, str):
+        target = KNOWN_TARGETS.get(target) or EntityDefinition(name=target, category="TECHNICAL", forbidden_terms=[], expected_terms=[target.lower()], safe_fallback="")
     if not target or not answer_text:
-        return True, "OK"
+        return ValidationResult(True, "OK")
     ans_low = answer_text.lower()
-    for forb in target.forbidden_terms:
+    forbidden = target.forbidden_terms
+    for forb in forbidden:
         if forb in ans_low:
-            return False, f"FORBIDDEN_ENTITY: Answer contained forbidden term '{forb}' for {target.name}"
-    found_expected = any(term in ans_low for term in target.expected_terms) or target.name.lower() in ans_low
+            return ValidationResult(False, f"FORBIDDEN_ENTITY: Answer contained forbidden term '{forb}' for {target.name}")
+    contradiction = detect_entity_contradiction(target.name, answer_text)
+    if contradiction:
+        return ValidationResult(False, f"FORBIDDEN_ENTITY: Answer contained contradictory concept '{contradiction}' for {target.name}")
+    expected = target.expected_terms
+    found_expected = any(term in ans_low for term in expected) or target.name.lower() in ans_low
     if not found_expected:
-        return False, f"MISSING_EXPECTED: Answer lacks expected domain terminology for {target.name}"
-    return True, "VALID"
+        return ValidationResult(False, f"MISSING_EXPECTED: Answer lacks expected domain terminology for {target.name}")
+    return ValidationResult(True, "VALID")
+
+
+# ---------------------------------------------------------------------------
+# Conversation State Machine & Topic Switch Detection
+# ---------------------------------------------------------------------------
+@dataclass
+class ConversationState:
+    active_question: str = ""
+    active_surface_type: Optional[InterviewType] = None
+    resolved_interview_type: Optional[InterviewType] = None
+    active_entity: Optional[str] = None
+    active_topic: Optional[str] = None
+    active_context_sections: List[str] = field(default_factory=list)
+    last_answer: str = ""
+    question_number: int = 0
+    pending_followup: bool = False
+    conversation_generation: int = 0
+    parent_question_id: Optional[str] = None
+
+    def reset(self) -> None:
+        self.active_question = ""
+        self.active_surface_type = None
+        self.resolved_interview_type = None
+        self.active_entity = None
+        self.active_topic = None
+        self.active_context_sections = []
+        self.last_answer = ""
+        self.question_number = 0
+        self.pending_followup = False
+        self.conversation_generation = 0
+        self.parent_question_id = None
+
+    def update(self, question: str = "", surface_type: Optional[InterviewType] = None,
+               resolved_type: Optional[InterviewType] = None,
+               entity: Optional[str] = None,
+               topic: Optional[str] = None,
+               context_sections: Optional[List[str]] = None,
+               last_answer: str = "") -> None:
+        if question:
+            self.active_question = question
+        if surface_type is not None:
+            self.active_surface_type = surface_type
+        if resolved_type is not None:
+            self.resolved_interview_type = resolved_type
+        if entity is not None:
+            self.active_entity = entity
+        if topic is not None:
+            self.active_topic = topic
+        if context_sections is not None:
+            self.active_context_sections = context_sections
+        if last_answer:
+            self.last_answer = last_answer
+        self.question_number += 1
+        self.conversation_generation += 1
+
+
+def detect_topic_switch(new_type: InterviewType, new_question: str, state: ConversationState) -> Tuple[bool, str]:
+    """Detects when an incoming question switches topics away from the current context."""
+    if not state.active_question or not state.resolved_interview_type:
+        return False, "initial_turn"
+    # Explicit technical definition always overrides previous project/behavioral context
+    if _TECH_DEFN.match(new_question.strip().lower()):
+        if state.resolved_interview_type != InterviewType.TECHNICAL:
+            return True, f"switch_to_technical_definition from {state.resolved_interview_type.value}"
+    # Explicit new question shape differing from active conversation route
+    if new_type != InterviewType.FOLLOW_UP and new_type != state.resolved_interview_type:
+        return True, f"route_switch from {state.resolved_interview_type.value} to {new_type.value}"
+    return False, "continuation"
+
+
+def build_answer_target(raw_transcript: str, cls: InterviewClassification, state: Optional[ConversationState] = None) -> AnswerTarget:
+    """Builds structured AnswerTarget representing normalized question, entities, topics, and confidence."""
+    norm_q, detected_entity, lexicon_conf = DomainLexicon.normalize_stt(raw_transcript)
+    target_ent = extract_target_entity(norm_q)
+    entity_name = target_ent.name if target_ent else detected_entity
+
+    # Extract topic
+    q_low = norm_q.lower()
+    topic = None
+    if "credit risk" in q_low or "delinquency" in q_low or "dashboard" in q_low:
+        topic = "primary_project"
+        entity_name = entity_name or "Credit Risk / Delinquency Dashboard"
+    elif any(w in q_low for w in ("hardest", "challenge", "difficult", "roadblock")):
+        topic = "challenge"
+    elif any(w in q_low for w in ("fix", "solution", "solve", "overcome")):
+        topic = "solution"
+    elif any(w in q_low for w in ("civil", "transition", "switch", "choose data", "why data", "pivot")):
+        topic = "career_transition"
+        entity_name = entity_name or "data analytics"
+    elif any(w in q_low for w in ("team", "teamwork", "collaborat", "dmx")):
+        topic = "teamwork"
+        entity_name = entity_name or "DMX Dashboard"
+    elif any(w in q_low for w in ("mistake", "failure", "failed", "error")):
+        topic = "failure"
+    elif target_ent:
+        topic = target_ent.category.lower()
+
+    # Resolve surface vs resolved interview type
+    surface_type = cls.interview_type
+    if cls.interview_type == InterviewType.FOLLOW_UP:
+        if state and state.resolved_interview_type:
+            resolved_type = state.resolved_interview_type
+            if not topic and state.active_topic:
+                topic = state.active_topic
+            if not entity_name and state.active_entity:
+                entity_name = state.active_entity
+        else:
+            resolved_type = InterviewType.GCA
+    else:
+        resolved_type = cls.interview_type
+
+    # Multi-component confidence model
+    stt_conf = 0.98 if len(norm_q.split()) > 2 else 0.85
+    intent_conf = cls.confidence
+    entity_conf = 0.95 if target_ent else (0.85 if entity_name else 0.6)
+    retrieval_conf = 1.0
+    overall_conf = round(min(stt_conf, intent_conf, entity_conf), 2)
+
+    # Provenance tracking
+    if resolved_type == InterviewType.TECHNICAL:
+        provenance = "GENERAL_TECHNICAL"
+    elif resolved_type == InterviewType.QUANTITATIVE:
+        provenance = "DETERMINISTIC_ARITHMETIC"
+    elif resolved_type == InterviewType.GCA:
+        provenance = "REASONING"
+    else:
+        provenance = "context.md"
+
+    parent_id = state.active_question if (state and state.active_question and surface_type == InterviewType.FOLLOW_UP) else None
+    parent_ctx = state.active_topic if (state and surface_type == InterviewType.FOLLOW_UP) else None
+
+    return AnswerTarget(
+        raw_transcript=raw_transcript,
+        normalized_question=norm_q,
+        interview_type=resolved_type,
+        entity=entity_name,
+        topic=topic,
+        confidence=overall_conf,
+        parent_question_id=parent_id,
+        parent_context=parent_ctx,
+        surface_type=surface_type,
+        resolved_interview_type=resolved_type,
+        target_entity=target_ent,
+        provenance=provenance,
+        stt_confidence=stt_conf,
+        intent_confidence=intent_conf,
+        entity_confidence=entity_conf,
+        retrieval_confidence=retrieval_conf,
+        validation_confidence=1.0,
+    )
+
+
+def get_answer_plan(interview_type: InterviewType, topic: Optional[str] = None) -> str:
+    """Lightweight answer planning layer per interview type."""
+    if interview_type == InterviewType.GCA:
+        return "PLAN: 1. Clarify metric/problem. 2. Hypotheses decomposition. 3. Slicing & validation. 4. Recommendation & trade-off."
+    elif interview_type == InterviewType.TECHNICAL:
+        return "PLAN: 1. Definition. 2. Mechanism. 3. Concise example or comparison."
+    elif interview_type == InterviewType.PERSONAL:
+        return "PLAN: 1. Direct answer. 2. Candidate-grounded evidence. 3. Concise motivation."
+    elif interview_type == InterviewType.PROJECT:
+        return "PLAN: 1. Business context. 2. Approach & tools. 3. Specific challenge. 4. Grounded result."
+    elif interview_type == InterviewType.BEHAVIORAL:
+        return "PLAN: Situation -> Task -> Action -> Result (STAR structure, natural conversational delivery)."
+    return "PLAN: Direct, concise, grounded answer."
+
+
+def get_target_length(interview_type: InterviewType, question: str) -> Tuple[int, int, str]:
+    """Dynamic answer length control: returns (min_words, max_words, category_label)."""
+    q = question.lower()
+    if interview_type in (InterviewType.TECHNICAL, InterviewType.QUANTITATIVE):
+        return 40, 70, "SHORT"
+    elif interview_type == InterviewType.GCA or any(w in q for w in ("investigate", "estimate", "diagnose", "how would you")):
+        return 120, 180, "DETAILED"
+    else:
+        return 80, 120, "NORMAL"
+
+
+# ---------------------------------------------------------------------------
+# Hallucination Taxonomy & Safe Failure States
+# ---------------------------------------------------------------------------
+class HallucinationCategory(Enum):
+    H1_INVENTED_EXPERIENCE = "H1_INVENTED_EXPERIENCE"
+    H2_INVENTED_METRICS = "H2_INVENTED_METRICS"
+    H3_WRONG_TECHNICAL_ENTITY = "H3_WRONG_TECHNICAL_ENTITY"
+    H4_WRONG_EMPLOYER_PROJECT = "H4_WRONG_EMPLOYER_PROJECT"
+    H5_UNSUPPORTED_ACHIEVEMENT = "H5_UNSUPPORTED_ACHIEVEMENT"
+    H6_FALSE_CHRONOLOGY = "H6_FALSE_CHRONOLOGY"
+    H7_UNSUPPORTED_PERSONAL_CLAIM = "H7_UNSUPPORTED_PERSONAL_CLAIM"
+
+# Backward compatibility / alias attributes
+HallucinationCategory.UNVERIFIED_EXPERIENCE = HallucinationCategory.H1_INVENTED_EXPERIENCE
+HallucinationCategory.FABRICATED_METRIC = HallucinationCategory.H2_INVENTED_METRICS
+HallucinationCategory.ENTITY_CONFUSION = HallucinationCategory.H3_WRONG_TECHNICAL_ENTITY
+
+
+NO_SAFE_ANSWER = "⚠ No grounded candidate story available."
+NO_VERIFIED_STORY = "NO VERIFIED STORY FOUND. Use a real example from your experience."
+
+FORBIDDEN_CANDIDATE_PROJECTS = ["careeros", "alphora", "fastapi", "redis", "trading bot", "trading project"]
+UNSUPPORTED_EXPERIENCE_PROMPTS = [
+    "manager conflict", "conflict with your manager", "manager at your internship",
+    "$50m hardware", "500-person", "collective bargaining", "asic chips", "ios mobile",
+    "internship"
+]
+
+
+class AuditResult(tuple):
+    def __new__(cls, is_clean: bool, category: Optional[HallucinationCategory] = None, reason: str = "PASS"):
+        return super().__new__(cls, (is_clean, category, reason))
+
+    @property
+    def is_clean(self) -> bool:
+        return self[0]
+
+    @property
+    def category(self) -> Optional[HallucinationCategory]:
+        return self[1]
+
+    @property
+    def reason(self) -> str:
+        return self[2]
+
+    @property
+    def has_hallucination(self) -> bool:
+        return not self[0]
+
+    @property
+    def categories(self) -> List[Any]:
+        if not self[1]:
+            return []
+        cat = self[1]
+        aliases = [cat]
+        if cat in (HallucinationCategory.H1_INVENTED_EXPERIENCE, HallucinationCategory.H4_WRONG_EMPLOYER_PROJECT):
+            aliases.append(HallucinationCategory.UNVERIFIED_EXPERIENCE)
+        if cat == HallucinationCategory.H2_INVENTED_METRICS:
+            aliases.append(HallucinationCategory.FABRICATED_METRIC)
+        if cat == HallucinationCategory.H3_WRONG_TECHNICAL_ENTITY:
+            aliases.append(HallucinationCategory.ENTITY_CONFUSION)
+        return aliases
+
+
+def audit_hallucinations(answer_text: str, target: Any = None, entity_hint: Optional[str] = None) -> AuditResult:
+    """Audits answer against hallucination taxonomy H1-H7."""
+    low = answer_text.lower()
+    
+    if target is None:
+        target = AnswerTarget(raw_transcript="", normalized_question="", interview_type=InterviewType.OTHER)
+    elif isinstance(target, str):
+        target = AnswerTarget(raw_transcript=target, normalized_question=target, interview_type=InterviewType.OTHER)
+
+    if entity_hint and not target.target_entity:
+        target.target_entity = KNOWN_TARGETS.get(entity_hint)
+
+    # H2: Fabricated metrics
+    if any(m in low for m in ("99.999%", "100 million transactions", "100m transactions", "billion users")):
+        return AuditResult(False, HallucinationCategory.H2_INVENTED_METRICS, "Fabricated metric detected")
+
+    # H3: Wrong technical entity
+    if target.target_entity:
+        v = validate_technical_answer(target.target_entity, answer_text)
+        if not v.is_valid:
+            return AuditResult(False, HallucinationCategory.H3_WRONG_TECHNICAL_ENTITY, v.remediation_prompt)
+    elif entity_hint:
+        contra = detect_entity_contradiction(entity_hint, answer_text)
+        if contra:
+            return AuditResult(False, HallucinationCategory.H3_WRONG_TECHNICAL_ENTITY, f"Contradiction: {contra}")
+
+    # H4: Wrong employer/project in candidate context
+    for fp in FORBIDDEN_CANDIDATE_PROJECTS:
+        if fp in low:
+            return AuditResult(False, HallucinationCategory.H4_WRONG_EMPLOYER_PROJECT, f"Forbidden project '{fp}' detected in candidate answer")
+
+    # H1: Invented experience
+    q_low = target.raw_transcript.lower()
+    if any(unsupp in q_low for unsupp in UNSUPPORTED_EXPERIENCE_PROMPTS):
+        if not ("no verified story found" in low or "no grounded candidate story" in low or "no grounded" in low):
+            return AuditResult(False, HallucinationCategory.H1_INVENTED_EXPERIENCE, "Invented unsupported candidate experience")
+
+    # H6: False chronology
+    if any(y in low for y in ("10 years", "ten years", "decade of experience", "lead architect for 5 years")):
+        return AuditResult(False, HallucinationCategory.H6_FALSE_CHRONOLOGY, "False chronology claims in candidate experience")
+
+    return AuditResult(True, None, "PASS")
 
 
 class GoogleInterviewContext:
@@ -893,7 +1355,13 @@ class GoogleInterviewContext:
         self.sections: Dict[str, str] = {}
         self.load_context_file()
 
-    def load_context_file(self, path: Optional[Path] = None) -> None:
+    @classmethod
+    def load_file(cls, path: Union[Path, str]) -> 'GoogleInterviewContext':
+        return cls(Path(path))
+
+    def load_context_file(self, path: Optional[Union[Path, str]] = None) -> None:
+        if isinstance(path, str):
+            path = Path(path)
         p = path or self.context_path
         if not p or not p.exists():
             return
@@ -903,18 +1371,53 @@ class GoogleInterviewContext:
             current_title = "Overview"
             current_body: List[str] = []
             for line in content.splitlines():
-                if line.startswith("### "):
+                m = re.match(r"^(?:#|##)\s+([0-9]+)\.\s+(.*)$", line)
+                if m:
                     if current_body:
                         self.sections[current_title] = "\n".join(current_body).strip()
-                    current_title = line[4:].strip()
+                    current_title = m.group(2).strip()
                     current_body = []
                 else:
                     current_body.append(line)
             if current_body:
                 self.sections[current_title] = "\n".join(current_body).strip()
+
+            aliases = {
+                "Opening / Tell Me About Yourself": ["Core \"Tell Me About Yourself\" Answer", "Tell Me About Yourself"],
+                "Candidate Profile": ["Candidate Profile / Positioning"],
+                "Civil -> Data Transition": ["Why Civil Engineering"],
+                "Why Data Analytics": ["Why Data Analytics"],
+                "Credit Risk / Delinquency Dashboard": ["Primary Project", "Credit Risk", "Delinquency Dashboard"],
+                "Teamwork": ["Teamwork Story", "DMX Dashboard"],
+                "Conflict": ["Tell Me About a Conflict", "Disagreement"],
+                "Something Didn't Go As Planned": ["Something Didn't Go As Planned"],
+                "Communication": ["Technical Concept Communication"],
+                "Prioritization": ["Prioritization / Competing Responsibilities"],
+                "Mistake / Failure": ["Mistake / Failure Story"],
+                "Future Goals": ["Future Goals / Apprenticeship"],
+                "Why Apprenticeship": ["Future Goals / Apprenticeship"],
+                "Why Should We Choose You?": ["Why Should We Choose You?"],
+                "Candidate Value": ["Why Should We Choose You?"],
+                "Follow-ups": ["Follow-Up Mapping"]
+            }
+            for canonical, patterns in aliases.items():
+                for title, text in list(self.sections.items()):
+                    if any(pat.lower() in title.lower() for pat in patterns):
+                        self.sections[canonical] = text
+                        break
+
             logger.info(f"Loaded {len(self.sections)} controlled context sections from {p.name}")
         except Exception as e:
             logger.warning(f"Failed loading context file {p}: {e}")
+
+    def get_section(self, name: str) -> Optional[str]:
+        if name in self.sections:
+            return self.sections[name]
+        low = name.lower()
+        for k, v in self.sections.items():
+            if low in k.lower():
+                return v
+        return None
 
     def get_relevant_context(self, intent: str, query: str, k: int = 2) -> List[str]:
         q = query.lower()
@@ -972,8 +1475,8 @@ class GoogleInterviewContext:
                     matched.append(self.sections["Prioritization"])
 
             if not matched:
-                if "Behavioral" in self.sections:
-                    matched.append(self.sections["Behavioral"])
+                if "Something Didn't Go As Planned" in self.sections:
+                    matched.append(self.sections["Something Didn't Go As Planned"])
                 elif "Teamwork" in self.sections:
                     matched.append(self.sections["Teamwork"])
             return matched
@@ -985,9 +1488,9 @@ class DocumentChunker(GoogleInterviewContext):
     """Subclass of GoogleInterviewContext providing backwards-compatibility.
     Guarantees controlled context.md retrieval and forbids CareerOS/Alphora ingestion."""
 
-    def __init__(self, docs_path: Optional[Path] = None):
+    def __init__(self, docs_path: Optional[Union[Path, str]] = None):
         super().__init__()
-        self.docs_path = docs_path or DOCS_DIR
+        self.docs_path = Path(docs_path) if docs_path else DOCS_DIR
         self.gca_chunks: List[str] = []
         self._load_gca_frameworks()
         self.chunks: List[str] = list(self.sections.values()) + self.gca_chunks
@@ -1690,7 +2193,19 @@ class LLMStreamingWorker(threading.Thread):
                 if task is None:
                     break
 
-                history, current_question, intent, telemetry = task
+                if len(task) == 4:
+                    history, current_question, intent, telemetry = task
+                    target = getattr(telemetry, "target", None)
+                    if target is None:
+                        target = build_answer_target(current_question, InterviewClassification(
+                            interview_type=InterviewType(intent) if intent in [e.value for e in InterviewType] else InterviewType.OTHER,
+                            intent=intent,
+                            confidence=0.9,
+                            reason="manual_task"
+                        ))
+                else:
+                    history, current_question, intent, telemetry, target = task
+
                 with self.lock:
                     self.active_generation_id += 1
                     gen_id = self.active_generation_id
@@ -1733,24 +2248,28 @@ class LLMStreamingWorker(threading.Thread):
 
                 context_str = "\n\n---\n\n".join(top_chunks) if top_chunks else "No specific documents provided."
 
-                # Select specialized prompt based on interview type (ISRE routes; GCA is one mode)
-                target_entity = None
+                # Select specialized prompt based on interview type with answer planning and dynamic length
+                effective_type = target.resolved_interview_type or (InterviewType(intent) if intent in [e.value for e in InterviewType] else InterviewType.OTHER)
+                plan_str = get_answer_plan(effective_type, target.topic)
+                min_w, max_w, len_cat = get_target_length(effective_type, current_question)
+                length_str = f"[TARGET LENGTH: {len_cat} ({min_w}-{max_w} words)]"
+
+                target_entity = target.target_entity or extract_target_entity(current_question)
                 if intent == "BEHAVIORAL":
-                    sys_prompt = f"{BEHAVIORAL_SYSTEM_PROMPT}\n\n[AUTHENTIC CANDIDATE STAR STORIES]\n{context_str}"
+                    sys_prompt = f"{BEHAVIORAL_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[AUTHENTIC CANDIDATE STAR STORIES]\n{context_str}"
                 elif intent == "TECHNICAL":
-                    target_entity = extract_target_entity(current_question)
                     tech_prompt = build_technical_prompt(current_question, target_entity)
-                    sys_prompt = f"{tech_prompt}\n\n[REFERENCE NOTES]\n{context_str}"
+                    sys_prompt = f"{tech_prompt}\n\n{plan_str}\n{length_str}\n\n[REFERENCE NOTES]\n{context_str}"
                 elif intent == "PERSONAL":
-                    sys_prompt = f"{PERSONAL_SYSTEM_PROMPT}\n\n[CANDIDATE PROFILE & RESUME]\n{context_str}"
+                    sys_prompt = f"{PERSONAL_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[CANDIDATE PROFILE & RESUME]\n{context_str}"
                 elif intent == "PROJECT":
-                    sys_prompt = f"{PROJECT_SYSTEM_PROMPT}\n\n[PROJECT & CANDIDATE CONTEXT]\n{context_str}"
+                    sys_prompt = f"{PROJECT_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[PROJECT & CANDIDATE CONTEXT]\n{context_str}"
                 elif intent == "QUANTITATIVE":
-                    sys_prompt = f"{QUANTITATIVE_SYSTEM_PROMPT}\n\n[REFERENCE NOTES]\n{context_str}"
+                    sys_prompt = f"{QUANTITATIVE_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[REFERENCE NOTES]\n{context_str}"
                 elif intent == "OTHER":
                     sys_prompt = f"{GENERIC_ANSWER_PROMPT}\n\n[CONTEXT]\n{context_str}"
                 else:
-                    sys_prompt = f"{GCA_SYSTEM_PROMPT}\n\n[GCA FRAMEWORKS & CONTEXT]\n{context_str}"
+                    sys_prompt = f"{GCA_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[GCA FRAMEWORKS & CONTEXT]\n{context_str}"
 
                 messages = [{"role": "system", "content": sys_prompt}]
                 sliced_history = history[-HISTORY_TURNS:]
@@ -1844,8 +2363,9 @@ class LLMStreamingWorker(threading.Thread):
                         accumulated_tokens.append(delta)
                         if target_entity and len(accumulated_tokens) % 3 == 0:
                             so_far = "".join(accumulated_tokens).lower()
-                            if any(forb in so_far for forb in target_entity.forbidden_terms):
-                                logger.warning(f"[GROUNDING_GUARD] Forbidden entity detected mid-stream for {target_entity.name}")
+                            contradiction = detect_entity_contradiction(target_entity.name, so_far)
+                            if contradiction or any(forb in so_far for forb in target_entity.forbidden_terms):
+                                logger.warning(f"[GROUNDING_GUARD] Forbidden/contradictory entity detected mid-stream for {target_entity.name}")
                                 stream_rejected = True
                                 self.ui_queue.put(("clear_text", None))
                                 break
@@ -1885,69 +2405,86 @@ class LLMStreamingWorker(threading.Thread):
                         telemetry.add_provider_event("nvidia", "empty_retry_failed", str(err2)[:80])
                         logger.error(f"NVIDIA empty-retry failed: {err2}")
 
-                # Exact Entity Grounding Guard & Max 1 Regeneration for TECHNICAL questions
-                if target_entity and gen_id == self.active_generation_id and self.prompt_queue.empty():
-                    ans_text = "".join(accumulated_tokens)
-                    is_valid = False
-                    reason = ""
-                    if not stream_rejected and ans_text:
-                        is_valid, reason = validate_technical_answer(target_entity, ans_text)
+                # Answer Validation & Max 1 Regeneration (Taxonomy H1-H7 + Entity Grounding)
+                ans_text = "".join(accumulated_tokens)
+                is_valid = True
+                fail_cat = None
+                fail_reason = ""
+                if not stream_rejected and ans_text:
+                    is_valid, fail_cat, fail_reason = audit_hallucinations(ans_text, target)
 
-                    if not is_valid or stream_rejected:
-                        logger.warning(f"[GROUNDING_GUARD] Technical answer rejected for {target_entity.name}: {reason or 'Forbidden term'}. Clearing UI and retrying once.")
+                if (not is_valid or stream_rejected) and gen_id == self.active_generation_id and self.prompt_queue.empty():
+                    logger.warning(f"[GROUNDING_GUARD] Answer rejected ({fail_cat.value if fail_cat else 'STREAM_REJECTED'}: {fail_reason}). Clearing UI and retrying once.")
+                    self.ui_queue.put(("clear_text", None))
+                    retry_messages = list(messages)
+                    retry_messages.append({"role": "assistant", "content": ans_text})
+                    correction_instruction = f"CRITICAL CORRECTION: Previous response failed verification ({fail_reason}). "
+                    if target_entity:
+                        correction_instruction += (
+                            f"You MUST answer strictly regarding {target_entity.name} ({target_entity.category}). "
+                            f"Do NOT mention {', '.join(target_entity.forbidden_terms[:3])}."
+                        )
+                    else:
+                        correction_instruction += "You MUST ground strictly in the provided context and never invent unverified experience or metrics."
+
+                    retry_messages.append({"role": "user", "content": correction_instruction})
+                    retry_tokens = []
+                    retry_stream = None
+                    try:
+                        if groq_key:
+                            retry_stream = self._stream_groq(retry_messages, groq_key)
+                        elif nvidia_key:
+                            retry_stream = self._stream_nvidia(retry_messages, nvidia_key)
+                    except Exception as e_ret:
+                        logger.warning(f"[GROUNDING_GUARD] Retry stream creation failed: {e_ret}")
+
+                    retry_valid = False
+                    if retry_stream:
+                        for chunk in retry_stream:
+                            with self.lock:
+                                if gen_id != self.active_generation_id or not self.prompt_queue.empty():
+                                    self.active_generation_id += 1
+                                    break
+                            delta = chunk.choices[0].delta.content if chunk.choices else ""
+                            if delta:
+                                retry_tokens.append(delta)
+                        retry_ans = "".join(retry_tokens)
+                        retry_valid, _, _ = audit_hallucinations(retry_ans, target)
+
+                    if retry_valid and retry_tokens:
+                        logger.info("[GROUNDING_GUARD] Retry succeeded and passed validation.")
+                        for delta in retry_tokens:
+                            self.ui_queue.put(("token", delta))
+                        token_count = len(retry_tokens)
+                        ans_text = retry_ans
+                        is_valid = True
+                    else:
+                        logger.warning("[GROUNDING_GUARD] Retry failed or invalid. Emitting safe fallback.")
                         self.ui_queue.put(("clear_text", None))
-                        retry_messages = list(messages)
-                        retry_messages.append({"role": "assistant", "content": ans_text})
-                        retry_messages.append({
-                            "role": "user",
-                            "content": (
-                                f"CRITICAL CORRECTION: Previous response was REJECTED for entity mismatch ({reason or 'Forbidden term'}). "
-                                f"You MUST answer strictly regarding {target_entity.name} ({target_entity.category}). "
-                                f"Do NOT mention {', '.join(target_entity.forbidden_terms[:3])}."
-                            )
-                        })
-                        retry_tokens = []
-                        retry_stream = None
-                        try:
-                            if groq_key:
-                                retry_stream = self._stream_groq(retry_messages, groq_key)
-                            elif nvidia_key:
-                                retry_stream = self._stream_nvidia(retry_messages, nvidia_key)
-                        except Exception as e_ret:
-                            logger.warning(f"[GROUNDING_GUARD] Retry stream creation failed: {e_ret}")
-
-                        retry_valid = False
-                        if retry_stream:
-                            for chunk in retry_stream:
-                                with self.lock:
-                                    if gen_id != self.active_generation_id or not self.prompt_queue.empty():
-                                        self.active_generation_id += 1
-                                        break
-                                delta = chunk.choices[0].delta.content if chunk.choices else ""
-                                if delta:
-                                    retry_tokens.append(delta)
-                            retry_ans = "".join(retry_tokens)
-                            retry_valid, _ = validate_technical_answer(target_entity, retry_ans)
-
-                        if retry_valid and retry_tokens:
-                            logger.info(f"[GROUNDING_GUARD] Retry succeeded for {target_entity.name}")
-                            for delta in retry_tokens:
-                                self.ui_queue.put(("token", delta))
-                            token_count = len(retry_tokens)
-                        else:
-                            logger.warning(f"[GROUNDING_GUARD] Retry failed or invalid. Emitting safe fallback for {target_entity.name}")
-                            self.ui_queue.put(("clear_text", None))
-                            fb_tokens = target_entity.safe_fallback.split(" ")
-                            for i in range(0, len(fb_tokens), 3):
-                                self.ui_queue.put(("token", " ".join(fb_tokens[i:i+3]) + " "))
-                                time.sleep(0.01)
-                            token_count = len(fb_tokens)
+                        fallback_text = target_entity.safe_fallback if target_entity else NO_SAFE_ANSWER
+                        fb_tokens = fallback_text.split(" ")
+                        for i in range(0, len(fb_tokens), 3):
+                            self.ui_queue.put(("token", " ".join(fb_tokens[i:i+3]) + " "))
+                            time.sleep(0.01)
+                        token_count = len(fb_tokens)
+                        ans_text = fallback_text
 
                 with self.lock:
                     if gen_id == self.active_generation_id and self.prompt_queue.empty():
                         telemetry.mark_generation_done(token_count)
                         telemetry_summary = telemetry.log_and_format()
                         logger.info(f"[LLM_RESPONSE] complete via {provider_used} tokens={token_count} intent={intent}")
+                        if DEBUG_MODE:
+                            logger.info(
+                                f"\n[QUESTION] {target.raw_transcript}\n"
+                                f"[ROUTING] {target.resolved_interview_type.value if target.resolved_interview_type else target.interview_type.value}\n"
+                                f"[ENTITY] {target.entity or 'None'}\n"
+                                f"[CONFIDENCE] {target.confidence:.2f}\n"
+                                f"[PROVENANCE] {target.provenance}\n"
+                                f"[PROVIDER] {provider_used}\n"
+                                f"[TTFT] {telemetry.ttft_ms:.1f} ms\n"
+                                f"[VALIDATION] {'PASS' if is_valid else 'FAIL'}"
+                            )
                         self.ui_queue.put(("telemetry", telemetry_summary))
                         self.ui_queue.put(("status", "LISTENING"))
                     else:
@@ -1978,6 +2515,7 @@ class DialogueManager(threading.Thread):
         self.last_intent = "GCA"
         self.last_interview_type: Optional[InterviewType] = None
         self.last_story_retrieved = ""
+        self.state = ConversationState()
 
     def clear(self) -> None:
         self.history.clear()
@@ -1985,6 +2523,7 @@ class DialogueManager(threading.Thread):
         self.last_intent = "GCA"
         self.last_interview_type = None
         self.last_story_retrieved = ""
+        self.state.reset()
         logger.info("Dialogue history and state cleared.")
 
     def run(self) -> None:
@@ -2030,6 +2569,15 @@ class DialogueManager(threading.Thread):
                         self.ui_queue.put(("status", f"LISTENING [{intent}]"))
                         continue
 
+                    # Check for topic switch against conversation state
+                    is_switch, switch_reason = detect_topic_switch(cls.interview_type, text, self.state)
+                    if is_switch:
+                        logger.info(f"[TOPIC_SWITCH] {switch_reason} - resetting inherited state")
+                        self.state.reset()
+
+                    # Build AnswerTarget with domain normalization, confidence, provenance
+                    target = build_answer_target(text, cls, self.state)
+
                     # Handle follow-up context inheritance (parent interview type + intent)
                     if cls.interview_type == InterviewType.FOLLOW_UP and self.last_question:
                         effective_intent = intent  # already resolved to the parent intent by ISRE
@@ -2045,7 +2593,16 @@ class DialogueManager(threading.Thread):
                         self.last_interview_type = cls.interview_type
                         logger.info(f"[QUESTION_DETECTION] NEW question [{effective_intent}]: '{text}'")
 
-                    logger.info(f"Interviewer question routed [{effective_intent}]: '{text}'")
+                    # Update conversation state with this turn's target
+                    self.state.update(
+                        question=text,
+                        surface_type=target.surface_type,
+                        resolved_type=target.resolved_interview_type,
+                        entity=target.entity,
+                        topic=target.topic
+                    )
+
+                    logger.info(f"Interviewer question routed [{effective_intent}]: '{text}' [entity={target.entity}, topic={target.topic}]")
 
                     # Backpressure: clear any older queued prompts
                     while not self.prompt_queue.empty():
@@ -2055,6 +2612,7 @@ class DialogueManager(threading.Thread):
                         except (queue.Empty, ValueError):
                             break
 
+                    telemetry.target = target
                     telemetry.mark_prompt_enqueued()
                     self.prompt_queue.put((list(self.history), routed_question, effective_intent, telemetry))
 

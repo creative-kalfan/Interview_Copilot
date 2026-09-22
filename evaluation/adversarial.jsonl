@@ -1,0 +1,17 @@
+{"input": "What is Power BI?", "expected_type": "TECHNICAL", "expected_entity": "Power BI"}
+{"input": "What is Power VA?", "expected_type": "TECHNICAL", "expected_entity": "Power VA"}
+{"input": "What is Power B?", "expected_type": "TECHNICAL", "expected_entity": "Power BI"}
+{"input": "Power bee?", "expected_type": "TECHNICAL", "expected_entity": "Power BI"}
+{"input": "Power Query?", "expected_type": "TECHNICAL", "expected_entity": "Power Query"}
+{"input": "Why?", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "And why?", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "What if the data is correct?", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "What would you check first?", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "Then what?", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "How would you validate that?", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "Actually, I meant the other project.", "expected_type": "FOLLOW_UP", "expected_entity": null}
+{"input": "What is a LEFT JOIN?", "expected_type": "TECHNICAL", "expected_entity": "LEFT JOIN"}
+{"input": "Tell me about yourself.", "expected_type": "PERSONAL", "expected_entity": null}
+{"input": "Tell me about a conflict with your manager.", "expected_type": "BEHAVIORAL", "expected_behavior": "NO_SAFE_ANSWER"}
+{"input": "Tell me about your internship.", "expected_type": "BEHAVIORAL", "expected_behavior": "NO_SAFE_ANSWER"}
+{"input": "How did your team disagree?", "expected_type": "BEHAVIORAL", "expected_behavior": "PASS"}

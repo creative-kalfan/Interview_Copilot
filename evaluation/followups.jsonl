@@ -1,0 +1,6 @@
+{"parent_question": "Tell me about your credit risk dashboard.", "parent_type": "PROJECT", "input": "What was the hardest part?", "expected_type": "FOLLOW_UP", "resolved_type": "PROJECT", "expected_topic": "challenge"}
+{"parent_question": "Tell me about your credit risk dashboard.", "parent_type": "PROJECT", "input": "How did you fix it?", "expected_type": "FOLLOW_UP", "resolved_type": "PROJECT", "expected_topic": "solution"}
+{"parent_question": "Tell me about your credit risk dashboard.", "parent_type": "PROJECT", "input": "What is normalization?", "expected_type": "TECHNICAL", "resolved_type": "TECHNICAL", "expected_topic": "database_design"}
+{"parent_question": "User engagement dropped 30% week-over-week. How would you investigate?", "parent_type": "GCA", "input": "Why?", "expected_type": "FOLLOW_UP", "resolved_type": "GCA", "expected_topic": "continuation"}
+{"parent_question": "User engagement dropped 30% week-over-week. How would you investigate?", "parent_type": "GCA", "input": "What would you check first?", "expected_type": "FOLLOW_UP", "resolved_type": "GCA", "expected_topic": "segmentation"}
+{"parent_question": "Tell me about a time you worked in a team.", "parent_type": "BEHAVIORAL", "input": "What did you learn from that experience?", "expected_type": "FOLLOW_UP", "resolved_type": "BEHAVIORAL", "expected_topic": "reflection"}

@@ -1,0 +1,20 @@
+{"input": "What is Power BI?", "expected_type": "TECHNICAL", "expected_entity": "Power BI", "expected_topic": "business_intelligence"}
+{"input": "Explain DAX.", "expected_type": "TECHNICAL", "expected_entity": "DAX", "expected_topic": "expression_language"}
+{"input": "What is Power Query?", "expected_type": "TECHNICAL", "expected_entity": "Power Query", "expected_topic": "etl"}
+{"input": "What is Tableau?", "expected_type": "TECHNICAL", "expected_entity": "Tableau", "expected_topic": "business_intelligence"}
+{"input": "What is SQL?", "expected_type": "TECHNICAL", "expected_entity": "SQL", "expected_topic": "query_language"}
+{"input": "What is a primary key?", "expected_type": "TECHNICAL", "expected_entity": "primary key", "expected_topic": "database_design"}
+{"input": "What is a LEFT JOIN?", "expected_type": "TECHNICAL", "expected_entity": "LEFT JOIN", "expected_topic": "sql_joins"}
+{"input": "Explain normalization.", "expected_type": "TECHNICAL", "expected_entity": "normalization", "expected_topic": "database_design"}
+{"input": "Tell me about yourself.", "expected_type": "PERSONAL", "expected_entity": null, "expected_topic": "candidate_profile"}
+{"input": "Walk me through your resume.", "expected_type": "PERSONAL", "expected_entity": null, "expected_topic": "resume_walkthrough"}
+{"input": "Why did you choose data analytics?", "expected_type": "PERSONAL", "expected_entity": "data analytics", "expected_topic": "career_transition"}
+{"input": "Why civil engineering to data analytics?", "expected_type": "PERSONAL", "expected_entity": "civil engineering", "expected_topic": "career_transition"}
+{"input": "Why Google?", "expected_type": "PERSONAL", "expected_entity": "Google", "expected_topic": "apprenticeship_motivation"}
+{"input": "Tell me about your credit risk dashboard.", "expected_type": "PROJECT", "expected_entity": "Credit Risk / Delinquency Dashboard", "expected_topic": "primary_project"}
+{"input": "Walk me through your delinquency dashboard.", "expected_type": "PROJECT", "expected_entity": "Credit Risk / Delinquency Dashboard", "expected_topic": "primary_project"}
+{"input": "Tell me about a time you worked in a team.", "expected_type": "BEHAVIORAL", "expected_entity": "DMX Dashboard", "expected_topic": "teamwork"}
+{"input": "Tell me about a mistake you made.", "expected_type": "BEHAVIORAL", "expected_entity": null, "expected_topic": "failure"}
+{"input": "Tell me about a time something didn't go as planned.", "expected_type": "BEHAVIORAL", "expected_entity": null, "expected_topic": "problem_solving"}
+{"input": "What is 30% of 90?", "expected_type": "QUANTITATIVE", "expected_entity": null, "expected_topic": "arithmetic"}
+{"input": "User engagement dropped 30% week-over-week. How would you investigate?", "expected_type": "GCA", "expected_entity": null, "expected_topic": "root_cause_investigation"}

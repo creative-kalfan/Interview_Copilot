@@ -1,0 +1,9 @@
+{"input": "What is Power BI?", "expected_type": "TECHNICAL", "expected_entity": "Power BI", "forbidden_concepts": ["apparent power", "volt-ampere", "power va", "rms voltage", "electrical power"], "expected_context_category": "NONE"}
+{"input": "What is Power VA?", "expected_type": "TECHNICAL", "expected_entity": "Power VA", "forbidden_concepts": ["business intelligence", "data visualization", "power bi", "dashboard", "dax"], "expected_context_category": "NONE"}
+{"input": "Explain DAX.", "expected_type": "TECHNICAL", "expected_entity": "DAX", "forbidden_concepts": ["volt-ampere", "apparent power", "power va"], "expected_context_category": "NONE"}
+{"input": "What is Power Query?", "expected_type": "TECHNICAL", "expected_entity": "Power Query", "forbidden_concepts": ["apparent power", "volt-ampere"], "expected_context_category": "NONE"}
+{"input": "What is Tableau?", "expected_type": "TECHNICAL", "expected_entity": "Tableau", "forbidden_concepts": ["apparent power", "volt-ampere"], "expected_context_category": "NONE"}
+{"input": "What is SQL?", "expected_type": "TECHNICAL", "expected_entity": "SQL", "forbidden_concepts": ["volt-ampere", "apparent power"], "expected_context_category": "NONE"}
+{"input": "What is a primary key?", "expected_type": "TECHNICAL", "expected_entity": "primary key", "forbidden_concepts": ["volt-ampere"], "expected_context_category": "NONE"}
+{"input": "What is a LEFT JOIN?", "expected_type": "TECHNICAL", "expected_entity": "LEFT JOIN", "forbidden_concepts": ["volt-ampere"], "expected_context_category": "NONE"}
+{"input": "What is normalization in relational databases?", "expected_type": "TECHNICAL", "expected_entity": "normalization", "forbidden_concepts": ["volt-ampere"], "expected_context_category": "NONE"}

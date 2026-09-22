@@ -531,8 +531,8 @@ def test_gca_vs_googliness_format() -> bool:
 
     time.sleep(1.0)
 
-    # 2. Googliness / STAR Prompt on real candidate story
-    star_q = "Tell me about a time you optimized database performance under high load."
+    # 2. Googliness / STAR Prompt on real candidate story from context.md
+    star_q = "Tell me about a time you worked in a team at DMX Technologies."
     top_star = chunker.get_top_k(star_q, intent="BEHAVIORAL", k=2)
     prompt_star = f"{BEHAVIORAL_SYSTEM_PROMPT}\n\n[AUTHENTIC CANDIDATE STAR STORIES]\n" + "\n\n".join(top_star)
     resp_star = _chat([{"role": "system", "content": prompt_star}, {"role": "user", "content": star_q}], 180, 0.3)
