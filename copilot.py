@@ -55,11 +55,11 @@ import logging
 import threading
 import re
 import shutil
+import difflib
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional, Union
 import tkinter as tk
-from tkinter import filedialog, messagebox
 
 import numpy as np
 
@@ -171,10 +171,11 @@ def bootstrap_workspace() -> None:
     for folder in [WORKSPACE_DIR, DOCS_DIR, LOGS_DIR, CONFIG_DIR]:
         folder.mkdir(parents=True, exist_ok=True)
 
-    log_file = LOGS_DIR / f"session_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    fh = logging.FileHandler(str(log_file), encoding="utf-8")
-    fh.setFormatter(logging.Formatter(LOG_FORMAT))
-    logger.addHandler(fh)
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        log_file = LOGS_DIR / f"session_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        fh = logging.FileHandler(str(log_file), encoding="utf-8")
+        fh.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger.addHandler(fh)
 
     try:
         current_script = Path(__file__).resolve()
@@ -375,6 +376,38 @@ class PerformanceTelemetry:
 # ---------------------------------------------------------------------------
 # 3. Intent Classification & Routing Layer (<2ms Local Heuristic)
 # ---------------------------------------------------------------------------
+class IntentResult(str):
+    """String-compatible (intent, should_trigger) return value so both
+    `cls == 'PERSONAL'`, `cls[0] == 'PERSONAL'`, and `intent, trig = cls` work seamlessly."""
+    def __new__(cls, intent: str, should_trigger: bool = True):
+        obj = super().__new__(cls, intent)
+        obj.intent = intent
+        obj.should_trigger = should_trigger
+        return obj
+
+    def __iter__(self):
+        yield str(self)
+        yield self.should_trigger
+
+    def __getitem__(self, idx):
+        if idx == 0:
+            return str(self)
+        if idx == 1:
+            return self.should_trigger
+        return super().__getitem__(idx)
+
+    def __eq__(self, other):
+        if isinstance(other, tuple):
+            return (str(self), self.should_trigger) == other
+        return super().__eq__(other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return super().__hash__()
+
+
 class IntentClassifier:
     """Ultra-fast local intent classifier. Categorizes interviewer utterances without LLM latency."""
 
@@ -382,7 +415,10 @@ class IntentClassifier:
         "drop", "decrease", "increase", "spike", "metric", "engagement", "revenue",
         "investigate", "how would you solve", "how would you approach", "how would you investigate",
         "what if", "suppose", "imagine", "estimate", "how many", "troubleshoot", "root cause",
-        "trade-off", "trade off", "problem", "solve", "situation where numbers", "why did"
+        "trade-off", "trade off", "problem", "solve", "situation where numbers", "why did",
+        "argue both sides", "what do you choose", "what does your answer depend on",
+        "should we put more budget", "rule out the possibility", "clean your dataset",
+        "stakeholder presentation", "fast but rough", "medium confidence"
     )
 
     BEHAVIORAL_INDICATORS = (
@@ -396,12 +432,15 @@ class IntentClassifier:
     TECHNICAL_INDICATORS = (
         "system design", "architecture", "scale", "concurrency", "distributed", "microservices",
         "database", "sharding", "cache", "redis", "kafka", "latency", "throughput", "p99",
-        "api design", "rest", "grpc", "algorithm", "data structure", "deadlock", "thread"
+        "api design", "rest", "grpc", "algorithm", "data structure", "deadlock", "thread",
+        "spring boot", "java", "flask", "eda", "exploratory data analysis", "power query",
+        "power bi", "power va", "dax", "arq", "fastapi", "react", "tableau", "sql"
     )
 
     PROJECT_INDICATORS = (
         "in your resume", "at your last company", "in your previous role", "walk me through your project",
-        "what was your stack", "what did you build", "how did you implement"
+        "what was your stack", "what did you build", "how did you implement",
+        "dmx", "internship at dmx", "your internship"
     )
 
     CLARIFICATION_INDICATORS = (
@@ -433,70 +472,81 @@ class IntentClassifier:
         return False
 
     @classmethod
-    def classify(cls, text: str) -> Tuple[str, bool]:
+    def classify(cls, text: str) -> IntentResult:
         """
         Classifies utterance into (intent, should_trigger_llm).
-        Intents: GCA, BEHAVIORAL, TECHNICAL, PROJECT, CLARIFICATION, SMALL_TALK, FOLLOW_UP, OTHER.
+        Intents: GCA, BEHAVIORAL, TECHNICAL, PROJECT, PERSONAL, CLARIFICATION, SMALL_TALK, FOLLOW_UP, OTHER.
         """
-        t = text.strip().lower()
+        raw_t = (text or "").strip()
+        if not raw_t:
+            return IntentResult("OTHER", False)
+
+        stripped_t = _strip_leading_fillers(raw_t)
+        if not stripped_t:
+            return IntentResult("SMALL_TALK", False)
+
+        norm_t, _, _ = DomainLexicon.normalize_stt(stripped_t) if "DomainLexicon" in globals() else (stripped_t, None, 1.0)
+        t = _strip_leading_fillers(norm_t).strip().lower()
         words = t.split()
         if not words:
-            return "OTHER", False
+            return IntentResult("SMALL_TALK", False)
 
         # 1. Check small talk / greetings first (punctuation-tolerant word match)
         t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
         for st in cls.SMALL_TALK_INDICATORS:
             if re.search(rf"\b{re.escape(st)}\b", t_norm):
-                if len(words) <= 6 and not any(k in t_norm for k in ("why", "how", "what", "design", "time")):
-                    return "SMALL_TALK", False
+                if len(words) <= 6 and not any(k in t_norm for k in ("why", "how", "what", "design", "time", "tell", "explain", "describe", "walk", "yourself", "argue", "trade")):
+                    return IntentResult("SMALL_TALK", False)
 
-        # 2. Check direct follow-up questions
+        # 2. Check Personal / Background questions (e.g. "Hi, tell me about yourself.", "Why Google?")
+        if _PERSONAL_RE.search(t):
+            return IntentResult("PERSONAL", True)
+
+        # 3. Check Project / Resume questions
+        if (_PROJECT_RE.search(t) or cls._hit(cls.PROJECT_INDICATORS, t)) and not cls._hit(cls.BEHAVIORAL_INDICATORS, t, stem=True):
+            return IntentResult("PROJECT", True)
+
+        # 4. Check Direct Technical / Definitional questions
+        if _TECH_DEFN.match(t) or (_TECH_TROUBLE.search(t) and any(tool in t for tool in _TECH_TOOLS)):
+            return IntentResult("TECHNICAL", True)
+
+        # 5. Check behavioral / STAR questions
+        if cls._hit(cls.BEHAVIORAL_INDICATORS, t, stem=True):
+            return IntentResult("BEHAVIORAL", True)
+
+        # 6. Check GCA / Case study questions
+        if cls._hit(cls.GCA_INDICATORS, t, stem=True):
+            return IntentResult("GCA", True)
+
+        # 7. Check Technical / System Design questions
+        if cls._hit(cls.TECHNICAL_INDICATORS, t):
+            return IntentResult("TECHNICAL", True)
+
+        # 8. Check direct follow-up questions
         for fu in cls.FOLLOW_UP_INDICATORS:
             if fu in t:
-                return "FOLLOW_UP", True
+                return IntentResult("FOLLOW_UP", True)
         if t in ("why?", "why", "how so?", "what happened?", "and then?"):
-            return "FOLLOW_UP", True
-        # Short challenge/interrogative continuations ("What if the data is correct?", "How would you
-        # validate that?", "And the trade-off?") inherit the previous question's context instead of
-        # starting a fresh analytical answer. Cold start is handled by DialogueManager.
+            return IntentResult("FOLLOW_UP", True)
         if len(words) <= 8 and (t in ("how?", "what?") or t.startswith(
             ("what if ", "what about", "and ", "but ", "so ", "then ")
         )):
-            return "FOLLOW_UP", True
+            return IntentResult("FOLLOW_UP", True)
 
-        # 3. Check behavioral / STAR questions
-        if cls._hit(cls.BEHAVIORAL_INDICATORS, t, stem=True):
-            return "BEHAVIORAL", True
-
-        # 4. Check GCA / Case study questions
-        if cls._hit(cls.GCA_INDICATORS, t, stem=True):
-            return "GCA", True
-
-        # 5. Check Technical / System Design questions
-        if cls._hit(cls.TECHNICAL_INDICATORS, t):
-            return "TECHNICAL", True
-
-        # 6. Check Project / Resume questions
-        if cls._hit(cls.PROJECT_INDICATORS, t):
-            return "PROJECT", True
-
-        # 7. Check Clarifications
+        # 9. Check Clarifications
         if cls._hit(cls.CLARIFICATION_INDICATORS, t):
-            return "CLARIFICATION", True
+            return IntentResult("CLARIFICATION", True)
 
         # Fallback question detection
-        is_question = t.endswith("?") or any(t.startswith(w) for w in ("what", "why", "how", "can you", "could you", "where"))
-        # Short wh-questions ("How?", "Why?", "What would you check first?", "Then what?") inherit
-        # the previous question's context instead of starting a fresh analytical answer.
-        # Personal "your X" questions are NOT follow-ups ("What are your strengths?").
+        is_question = _looks_like_question(t) or t.endswith("?") or any(t.startswith(w) for w in ("what", "why", "how", "can you", "could you", "where"))
         if is_question and len(words) <= 6 and not t.startswith(("what are your", "what is your", "whats your")):
-            return "FOLLOW_UP", True
+            return IntentResult("FOLLOW_UP", True)
         if is_question and len(words) >= 4:
-            return "GCA", True  # default analytical question to GCA framing
+            return IntentResult("GCA", True)  # default analytical question to GCA framing
         elif len(words) >= 12:
-            return "GCA", True
+            return IntentResult("GCA", True)
 
-        return "OTHER", False
+        return IntentResult("OTHER", False)
 
 # ---------------------------------------------------------------------------
 # 3b. Interview Separation & Routing Engine (ISRE)
@@ -521,12 +571,17 @@ class InterviewClassification:
     reason: str
     should_trigger: bool = True
     latency_ms: float = 0.0
+    raw_question: str = ""
+
+
+ISREDecision = InterviewClassification
 
 
 _TECH_TOOLS = (
     "power bi", "tableau", "sql", "redis", "readies", "reedies", "readings", "postgres", "docker", "kafka", "api",
     "fastapi", "django", "react", "next.js", "python", "etl", "json", "nosql",
     "mongodb", "graphql", "aws", "azure", "kubernetes", "spark", "server",
+    "spring boot", "java", "flask", "eda", "exploratory data analysis", "power query", "dax", "arq",
 )
 
 _NUM = r"(\d[\d,]*(?:\.\d+)?)"
@@ -545,7 +600,8 @@ _TECH_WHY_USE = re.compile(r"why\s+(?:would|did|do|should)\s+you\s+(?:use|choose
 _PROJECT_RE = re.compile(
     r"(careeros|career\s*os|care\s*arrows?|gear\s*arrows?|careyros|your project|the project|your (?:trading|job ingestion|blog|syntheseed)|"
     r"project architecture|walk me through your (?:project|architecture)|biggest challenge|job ingestion|"
-    r"credit risk|delinquency|in (?:your|the) dashboard|your dashboard|the dashboard|built in power bi|portfolio project)"
+    r"credit risk|delinquency|in (?:your|the) dashboard|your dashboard|the dashboard|built in power bi|portfolio project|"
+    r"dmx|internship at dmx|your internship)"
 )
 _PERSONAL_RE = re.compile(
     r"(tell me about yourself|yourself\b|walk me through your resume|your background|"
@@ -556,18 +612,37 @@ _PERSONAL_RE = re.compile(
 _FOLLOW_CTX = re.compile(r"^(why|how|and|so|then|but|what did|what was|what would|what made)\b")
 _FOLLOW_CTX_MAX_WORDS = 12
 
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:(?:hi|hello|hey|okay|ok|so|well|um|uh|alright|right|now|good\s+(?:morning|afternoon|evening)|thanks\s+for\s+joining)[\s,.\-!]+)+",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_fillers(text: str) -> str:
+    return _LEADING_FILLER_RE.sub("", (text or "").strip()).strip()
+
+
 # ---------------------------------------------------------------------------
 # 4. Dynamic Document Context Retrieval (Intent-Aware BM25)
 # ---------------------------------------------------------------------------
 def _looks_like_question(text: str) -> bool:
     """Mic-channel guard: question-shaped utterances (incl. short follow-ups) and interviewer-style
     imperative prompts trigger guidance; spoken candidate narration ("I built ...") does not."""
-    t = text.strip().lower()
-    return t.endswith("?") or t.startswith((
-        "what", "why", "how", "which", "when", "where", "who", "can you", "could you", "then what", "and the",
-        "estimate", "calculate", "suppose", "imagine", "design", "explain", "describe", "tell me",
-        "walk me", "compare", "given ", "diagnose", "evaluate", "assess", "troubleshoot", "prioritize",
-    ))
+    stripped = _strip_leading_fillers(text)
+    if not stripped:
+        return False
+    norm_t, _, _ = DomainLexicon.normalize_stt(stripped) if "DomainLexicon" in globals() else (stripped, None, 1.0)
+    t = _strip_leading_fillers(norm_t).lower()
+    return (
+        t.endswith("?")
+        or "argue both sides" in t
+        or t.startswith((
+            "what", "why", "why ", "how", "which", "when", "where", "who", "can you", "could you", "then what", "and the",
+            "estimate", "calculate", "suppose", "imagine", "design", "explain", "describe", "tell me",
+            "walk me", "compare", "given ", "diagnose", "evaluate", "assess", "troubleshoot", "prioritize",
+            "argue both sides", "a trade-off",
+        ))
+    )
 
 
 def _parse_num(s: str) -> float:
@@ -641,17 +716,24 @@ class ISRE:
         "diagnose", "prioritize", "prioritization", "decomposition", "how to approach",
         "how to solve", "how would you approach", "how would you investigate",
         "how would you solve", "root cause", "investigation strategy",
+        "argue both sides", "what do you choose", "what does your answer depend on",
+        "should we put more budget", "rule out the possibility", "clean your dataset",
+        "stakeholder presentation", "fast but rough", "medium confidence",
     )
 
     @classmethod
-    def classify(cls, text: str, prev_type: Optional[InterviewType] = None,
-                 prev_question: str = "") -> InterviewClassification:
+    def classify(cls, text: str, prev_type: Optional[Any] = None,
+                 prev_question: str = "", is_interviewer: bool = True) -> InterviewClassification:
         t0 = time.perf_counter()
-        t = text.strip().lower()
-        words = t.split()
+        if isinstance(prev_type, bool):
+            is_interviewer = prev_type
+            prev_type = None
+
+        raw_text = (text or "").strip()
 
         def finish(itype: InterviewType, confidence: float, reason: str,
-                   intent: Optional[str] = None, should_trigger: bool = True) -> InterviewClassification:
+                   intent: Optional[str] = None, should_trigger: bool = True,
+                   q_out: Optional[str] = None) -> InterviewClassification:
             return InterviewClassification(
                 interview_type=itype,
                 intent=intent if intent is not None else itype.value,
@@ -659,53 +741,69 @@ class ISRE:
                 reason=reason,
                 should_trigger=should_trigger,
                 latency_ms=(time.perf_counter() - t0) * 1000,
+                raw_question=q_out if q_out is not None else raw_text,
             )
+
+        if not raw_text:
+            return finish(InterviewType.OTHER, 0.9, "empty text", intent="OTHER", should_trigger=False)
+
+        stripped_raw = _strip_leading_fillers(raw_text)
+        if not stripped_raw:
+            return finish(InterviewType.OTHER, 0.9, "greeting/small talk", intent="OTHER", should_trigger=False)
+
+        norm_text, _, _ = DomainLexicon.normalize_stt(stripped_raw) if "DomainLexicon" in globals() else (stripped_raw, None, 1.0)
+        t_clean = _strip_leading_fillers(norm_text).strip()
+        t = t_clean.lower()
+        words = t.split()
 
         if not words:
             return finish(InterviewType.OTHER, 0.9, "empty text", intent="OTHER", should_trigger=False)
+
+        if not is_interviewer and not _looks_like_question(raw_text):
+            return finish(InterviewType.OTHER, 0.9, "candidate non-question speech", intent="OTHER", should_trigger=False, q_out=t_clean)
 
         # 0. Check small talk / greetings first (punctuation-tolerant match)
         t_norm = re.sub(r"[^a-z0-9\s]", " ", t)
         for st in IntentClassifier.SMALL_TALK_INDICATORS:
             if re.search(rf"\b{re.escape(st)}\b", t_norm):
-                if len(words) <= 6 and not any(k in t_norm for k in ("why", "how", "what", "design", "time", "drop", "solve")):
-                    return finish(InterviewType.OTHER, 0.9, "greeting/small talk", intent="OTHER", should_trigger=False)
+                if len(words) <= 6 and not any(k in t_norm for k in ("why", "how", "what", "design", "time", "drop", "solve", "tell", "explain", "describe", "walk", "yourself", "argue", "trade")):
+                    return finish(InterviewType.OTHER, 0.9, "greeting/small talk", intent="OTHER", should_trigger=False, q_out=t_clean)
 
         # 1. QUANTITATIVE: deterministic arithmetic first (exact + zero LLM latency)
-        det = quant_answer(text)
+        det = quant_answer(t_clean) or quant_answer(raw_text)
         if det is not None:
-            return finish(InterviewType.QUANTITATIVE, 0.97, "deterministic arithmetic pattern")
+            return finish(InterviewType.QUANTITATIVE, 0.97, "deterministic arithmetic pattern", q_out=t_clean)
         if _QUANT_SHAPE.search(t):
-            return finish(InterviewType.QUANTITATIVE, 0.8, "quantitative reasoning shape")
+            return finish(InterviewType.QUANTITATIVE, 0.8, "quantitative reasoning shape", q_out=t_clean)
 
         # 2. PERSONAL / background (evaluated early so "Why Google?" / "Why did you move..." route to PERSONAL)
         if _PERSONAL_RE.search(t):
-            return finish(InterviewType.PERSONAL, 0.85, "personal/background question")
+            return finish(InterviewType.PERSONAL, 0.85, "personal/background question", q_out=t_clean)
 
-        # 3. PROJECT deep-dive (explicit project mentions)
-        if _PROJECT_RE.search(t):
-            return finish(InterviewType.PROJECT, 0.88, "project-specific deep-dive question")
+        # 3. PROJECT deep-dive (explicit project mentions, unless behavioral conflict/disagreement/time question)
+        if _PROJECT_RE.search(t) and not IntentClassifier._hit(IntentClassifier.BEHAVIORAL_INDICATORS, t, stem=True):
+            return finish(InterviewType.PROJECT, 0.88, "project-specific deep-dive question", q_out=t_clean)
 
         # 4. Direct technical / definitional knowledge (never GCA-scaffolded)
         if _TECH_DEFN.match(t):
-            return finish(InterviewType.TECHNICAL, 0.9, "direct conceptual/definitional question")
+            return finish(InterviewType.TECHNICAL, 0.9, "direct conceptual/definitional question", q_out=t_clean)
         if _TECH_TROUBLE.search(t) and any(tool in t for tool in _TECH_TOOLS):
-            return finish(InterviewType.TECHNICAL, 0.85, "technical troubleshooting question")
+            return finish(InterviewType.TECHNICAL, 0.85, "technical troubleshooting question", q_out=t_clean)
 
         # 5. BEHAVIORAL (STAR stories)
         if IntentClassifier._hit(IntentClassifier.BEHAVIORAL_INDICATORS, t, stem=True):
-            return finish(InterviewType.BEHAVIORAL, 0.9, "behavioral/STAR experience question")
+            return finish(InterviewType.BEHAVIORAL, 0.9, "behavioral/STAR experience question", q_out=t_clean)
 
         # 6. FOLLOW_UP: contextual continuation or follow-up question shape
         if prev_type == InterviewType.PROJECT and (_TECH_WHY_USE.search(t) or any(tool in t for tool in _TECH_TOOLS)):
-            return finish(InterviewType.FOLLOW_UP, 0.9, "follow-up inheriting parent PROJECT", intent="PROJECT")
+            return finish(InterviewType.FOLLOW_UP, 0.9, "follow-up inheriting parent PROJECT", intent="PROJECT", q_out=t_clean)
 
         # Architecture and tech tool justifications without parent context route to PROJECT / TECHNICAL
         if prev_type is None:
             if "architecture" in t and any(w in t for w in ("why", "choose", "pick", "design")):
-                return finish(InterviewType.PROJECT, 0.75, "project/architecture choice question")
+                return finish(InterviewType.PROJECT, 0.75, "project/architecture choice question", q_out=t_clean)
             if _TECH_WHY_USE.search(t) and any(tool in t for tool in _TECH_TOOLS):
-                return finish(InterviewType.TECHNICAL, 0.8, "tool/technology justification question")
+                return finish(InterviewType.TECHNICAL, 0.8, "tool/technology justification question", q_out=t_clean)
 
         is_fu_word = any(fu in t for fu in IntentClassifier.FOLLOW_UP_INDICATORS)
         is_short_cont = (
@@ -717,34 +815,34 @@ class ISRE:
         if is_fu_word or is_short_cont:
             if prev_type in cls._PARENT_TYPES:
                 return finish(InterviewType.FOLLOW_UP, 0.9,
-                              f"follow-up inheriting parent {prev_type.value}", intent=prev_type.value)
-            return finish(InterviewType.FOLLOW_UP, 0.75, "follow-up without parent context", intent="GCA")
+                              f"follow-up inheriting parent {prev_type.value}", intent=prev_type.value, q_out=t_clean)
+            return finish(InterviewType.FOLLOW_UP, 0.75, "follow-up without parent context", intent="GCA", q_out=t_clean)
 
         # 7. Project/Architecture choice without prior context
         if "architecture" in t and any(w in t for w in ("why", "choose", "pick", "design")):
-            return finish(InterviewType.PROJECT, 0.75, "project/architecture choice question")
+            return finish(InterviewType.PROJECT, 0.75, "project/architecture choice question", q_out=t_clean)
 
         # 8. TECHNICAL tool justification and domain questions
         if _TECH_WHY_USE.search(t) and any(tool in t for tool in _TECH_TOOLS):
-            return finish(InterviewType.TECHNICAL, 0.8, "tool/technology justification question")
+            return finish(InterviewType.TECHNICAL, 0.8, "tool/technology justification question", q_out=t_clean)
         if IntentClassifier._hit(IntentClassifier.TECHNICAL_INDICATORS, t):
-            return finish(InterviewType.TECHNICAL, 0.8, "technical domain question")
+            return finish(InterviewType.TECHNICAL, 0.8, "technical domain question", q_out=t_clean)
 
         # 9. GCA: open-ended analytical problem solving
         if IntentClassifier._hit(IntentClassifier.GCA_INDICATORS, t, stem=True) or any(k in t for k in cls._GCA_CUES):
-            return finish(InterviewType.GCA, 0.85, "open-ended analytical problem solving")
+            return finish(InterviewType.GCA, 0.85, "open-ended analytical problem solving", q_out=t_clean)
 
         # 10. Question vs Non-question check
-        is_q = _looks_like_question(text) or t.endswith("?")
+        is_q = _looks_like_question(t_clean) or _looks_like_question(raw_text) or t.endswith("?")
 
         # 11. Pure continuation without parent context (cold start)
         if is_q and t in ("why?", "why", "how so?", "what happened?", "and then?"):
-            return finish(InterviewType.FOLLOW_UP, 0.7, "follow-up without parent context", intent="GCA")
+            return finish(InterviewType.FOLLOW_UP, 0.7, "follow-up without parent context", intent="GCA", q_out=t_clean)
 
         # 12. Safe fallback: generic direct answer (NEVER default to GCA)
         if is_q:
-            return finish(InterviewType.OTHER, 0.5, "unclassified question -> generic direct answer", intent="OTHER")
-        return finish(InterviewType.OTHER, 0.6, "non-question speech", intent="OTHER", should_trigger=False)
+            return finish(InterviewType.OTHER, 0.5, "unclassified question -> generic direct answer", intent="OTHER", q_out=t_clean)
+        return finish(InterviewType.OTHER, 0.6, "non-question speech", intent="OTHER", should_trigger=False, q_out=t_clean)
 
 
 # ---------------------------------------------------------------------------
@@ -756,10 +854,11 @@ class EntityDefinition:
     category: str
     forbidden_terms: List[str]
     expected_terms: List[str]
-    safe_fallback: str
+    safe_fallback: str = ""
 
 
 EntityTarget = EntityDefinition
+TargetEntity = EntityDefinition
 
 
 @dataclass
@@ -781,6 +880,7 @@ class AnswerTarget:
     entity_confidence: float = 1.0
     retrieval_confidence: float = 1.0
     validation_confidence: float = 1.0
+    recovery_hint: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -888,12 +988,96 @@ KNOWN_TARGETS: Dict[str, EntityDefinition] = {
             "SQL (Structured Query Language) is the domain-specific language used for managing, querying, "
             "and manipulating data in relational database systems."
         )
-    )
+    ),
+    "Redis": TargetEntity(
+        "Redis",
+        "DATA_STORE",
+        ["circle", "diameter", "geometry", "circumference"],
+        ["in-memory", "cache", "key-value", "redis", "latency", "data", "store", "database"],
+        safe_fallback=(
+            "Redis is an open-source, in-memory key-value data store used as a low-latency cache, "
+            "database, and message broker."
+        ),
+    ),
+    "FastAPI": TargetEntity(
+        "FastAPI",
+        "WEB_FRAMEWORK",
+        [],
+        ["python", "asgi", "api", "fastapi", "pydantic", "async", "rest", "web", "framework"],
+        safe_fallback=(
+            "FastAPI is a high-performance Python ASGI web framework for building REST APIs using "
+            "type hints and Pydantic validation."
+        ),
+    ),
+    "React": TargetEntity(
+        "React",
+        "FRONTEND_LIBRARY",
+        ["chemical", "inductor", "capacitor", "molecule"],
+        ["javascript", "ui", "component", "virtual dom", "react", "frontend", "state", "library"],
+        safe_fallback=(
+            "React is a declarative JavaScript library for building component-based user interfaces "
+            "using a virtual DOM and reactive state management."
+        ),
+    ),
+    "Java Spring Boot": TargetEntity(
+        "Java Spring Boot",
+        "BACKEND_FRAMEWORK",
+        [],
+        ["java", "spring", "microservice", "backend", "api", "application", "framework", "boot"],
+        safe_fallback=(
+            "Java Spring Boot is an opinionated Java backend framework that simplifies building "
+            "production-ready Spring applications and microservices."
+        ),
+    ),
+    "Flask": TargetEntity(
+        "Flask",
+        "WEB_FRAMEWORK",
+        ["thermos", "laboratory"],
+        ["python", "wsgi", "microframework", "web", "flask", "api", "route", "lightweight"],
+        safe_fallback=(
+            "Flask is a lightweight Python WSGI microframework for building web applications and REST APIs."
+        ),
+    ),
+    "EDA": TargetEntity(
+        "EDA",
+        "ANALYTICS_CONCEPT",
+        [],
+        ["exploratory data analysis", "eda", "distribution", "outlier", "pattern", "missing", "summary", "variable", "data"],
+        safe_fallback=(
+            "EDA (Exploratory Data Analysis) is the process of summarizing, visualizing, and inspecting datasets "
+            "to uncover distributions, patterns, missing values, and outliers before formal modeling."
+        ),
+    ),
+    "DMX Technologies": TargetEntity(
+        "DMX Technologies",
+        "CANDIDATE_EXPERIENCE",
+        [],
+        ["dmx", "team", "dashboard", "project", "intern", "data", "analytics", "sql", "redis", "license", "story", "priority", "ownership"],
+        safe_fallback=(
+            "At DMX Technologies, I collaborated with the team to align priorities and clarify ownership on dashboard "
+            "and reporting deliverables."
+        ),
+    ),
 }
 
 
 class DomainLexicon:
     """Deterministic domain lexicon and STT normalizer with contextual validation."""
+
+    PHRASE_CORRECTIONS = [
+        (r"\btell me about your\s+(?:sin|self|selves|cell)\b", "tell me about yourself", None),
+        (r"^(?:why\s+googling|my\s+google)[?.!]*$", "Why Google?", None),
+        (r"\bwhy\s+googling\b", "Why Google", None),
+        (r"\bwhat is (?:it\s+last|a\s+flask)\b", "What is Flask", "Flask"),
+        (r"\bwhat is meant by (?:eta|lda|e\.?\s*d\.?\s*a\.?)\b", "What is meant by EDA (Exploratory Data Analysis)", "EDA"),
+        (r"\bwhat is (?:eta|lda)\b(?![^?]*\b(?:arrival|topic\s+model|discriminant)\b)", "What is EDA (Exploratory Data Analysis)", "EDA"),
+        (r"\b(?:yet\s+red\s+off\.?\s*first\s+but\s+rough|a\s+red\s+off)\b", "A trade-off: fast but rough", None),
+        (r"\bfor our medium confidence\b", "4 hours, medium confidence", None),
+        (r"\bbefore i take hold of presentation\b", "before a stakeholder presentation", None),
+        (r"\btake hold of\b(?=.*presentation)", "stakeholder", None),
+        (r"\broll out the possibility\b", "rule out the possibility", None),
+        (r"\bthe\s+mx\b", "DMX Technologies", "DMX Technologies"),
+    ]
 
     ALIASES = {
         "Power BI": [r"\bpower\s*(?:bee|b\s*i)\b", r"\bpowerbi\b", r"\bpbi\b"],
@@ -902,6 +1086,12 @@ class DomainLexicon:
         "DAX": [r"\bd\.a\.x\.|\bd\s*a\s*x\b", r"\bdacs\b"],
         "Tableau": [r"\b(?:tablo|tab\s*low)\b"],
         "SQL": [r"\bs\.q\.l\.|\bs\s*q\s*l\b"],
+        "FastAPI": [r"\bfirst\s*api\b", r"\bfast\s*a\.?\s*p\.?\s*i\.?\b", r"\bfast\s*api\b"],
+        "Java Spring Boot": [r"\bjava\s*spring\s*book\b", r"\bjavas?\s*priak\b", r"\bjawa\s*spring\s*boot\b", r"\bspring\s*boat\b", r"\bjava\s*spring\s*boot\b", r"\bspring\s*boot\b"],
+        "Redis": [r"\breadies\b", r"\breedies\b", r"\bredis\b"],
+        "Flask": [r"\bflask\b"],
+        "React": [r"\breact(?:\.?js)?\b"],
+        "EDA": [r"\bexploratory\s+data\s+analysis\b", r"\beda\b"],
         "Excel": [r"\bms\s*excel\b"],
         "Google Sheets": [r"\b(?:gsheets|g\s*sheets)\b"],
         "Credit Risk": [r"\bcredit[\s-]risk\b"],
@@ -911,6 +1101,27 @@ class DomainLexicon:
         "data visualization": [r"\bdata\s*viz\b", r"\bdataviz\b"]
     }
 
+    CANONICAL_QUESTIONS = [
+        "Tell me about yourself",
+        "Why Google?",
+        "Why this role?",
+        "What is Redis?",
+        "What is FastAPI?",
+        "What is React?",
+        "What is Java Spring Boot?",
+        "What is Flask?",
+        "What is meant by EDA?",
+        "What is Power BI?",
+        "What is Power Query?",
+        "What is DAX?",
+        "What is ETL vs ELT?",
+        "Tell me about your Credit Risk project",
+        "Tell me about your internship at DMX Technologies",
+        "Tell me about a time you had a disagreement with your team",
+        "Tell me about a time you made a mistake",
+        "What are your strengths and weaknesses?",
+    ]
+
     BI_CONTEXT_KEYWORDS = {"dashboard", "report", "visualization", "viz", "analytics", "microsoft", "dax", "tool", "software", "bi"}
 
     @classmethod
@@ -919,12 +1130,33 @@ class DomainLexicon:
         detected_entity = None
         conf = 1.0
 
-        # Strict non-replacement: power va -> Power VA (never Power BI)
-        if re.search(r"\bpower\s*(?:v\s*a|va)\b", norm, flags=re.I) or re.search(r"\bpowerva\b", norm, flags=re.I):
-            norm = re.sub(r"\bpower\s*(?:v\s*a|va)\b", "Power VA", norm, flags=re.I)
+        # CRITICAL INVARIANT: Keep "Power VA" preservation check FIRST in normalize_stt
+        # so "Power VA" is NEVER collapsed into "Power BI"
+        if re.search(r"\bpower\s*v\.?\s*a\.?\b", norm, re.IGNORECASE) or re.search(r"\bpowerva\b", norm, re.IGNORECASE):
+            norm = re.sub(r"\bpower\s*v\.?\s*a\.?\b", "Power VA", norm, flags=re.I)
             norm = re.sub(r"\bpowerva\b", "Power VA", norm, flags=re.I)
-            detected_entity = "Power VA"
-            conf = 0.98
+            return norm, "Power VA", 0.98
+
+        # Phrase-level phonetic & semantic STT corrections
+        for pat, repl, ent in cls.PHRASE_CORRECTIONS:
+            if re.search(pat, norm, flags=re.I):
+                norm = re.sub(pat, repl, norm, flags=re.I)
+                if ent and detected_entity is None:
+                    detected_entity = ent
+                conf = 0.94
+
+        # Context-guarded homophone rule: Radius -> Redis
+        if re.search(r"\b(?:what\s+is\s+(?:the\s+)?radius|radius\s+in\s+(?:backend|caching|database|system)|use\s+radius)\b", norm, re.IGNORECASE) and not re.search(r"\b(?:circle|sphere|diameter|circumference|geometry|geometric|pi|angle|cylinder|cone)\b", norm, re.IGNORECASE):
+            norm = re.sub(r"\bthe\s+radius\b", "Redis", norm, flags=re.I)
+            norm = re.sub(r"\bradius\b", "Redis", norm, flags=re.I)
+            detected_entity = "Redis"
+            conf = 0.93
+
+        # Context-guarded homophone rule: Reaction / Reactance -> React
+        if re.search(r"\bwhat\s+is\s+(?:the\s+)?(?:reaction|reactance)\b", norm, re.IGNORECASE) and not re.search(r"\b(?:chemical|chemistry|inductor|capacitor|impedance|acid|molecule|circuit|voltage)\b", norm, re.IGNORECASE):
+            norm = re.sub(r"\bwhat\s+is\s+(?:the\s+)?(?:reaction|reactance)\b", "What is React", norm, flags=re.I)
+            detected_entity = "React"
+            conf = 0.93
 
         # Unambiguous entity aliases
         for entity, patterns in cls.ALIASES.items():
@@ -932,10 +1164,12 @@ class DomainLexicon:
                 continue
             for pat in patterns:
                 if re.search(pat, norm, flags=re.I):
-                    norm = re.sub(pat, entity, norm, flags=re.I)
+                    if entity not in norm:
+                        norm = re.sub(pat, entity, norm, flags=re.I)
                     if detected_entity is None:
                         detected_entity = entity
                     conf = 0.95
+                    break
 
         # Contextual alias: 'power by' -> 'Power BI' ONLY when surrounding context indicates BI/data
         if re.search(r"\bpower\s*by\b", norm, flags=re.I):
@@ -962,6 +1196,64 @@ class DomainLexicon:
         norm, _, _ = cls.normalize_stt(text)
         return norm
 
+    @classmethod
+    def recover_closest_question(cls, text: str) -> Tuple[str, Optional[str]]:
+        """Phonetically & semantically recover closest canonical interview question when STT is noisy."""
+        if not text or not text.strip():
+            return text, None
+        if re.search(r"\bpower\s*v\.?\s*a\.?\b|\bpowerva\b", text, re.IGNORECASE):
+            return text, None
+        if re.search(r"\d", text):
+            return text, None
+
+        stripped = _strip_leading_fillers(text) if "_strip_leading_fillers" in globals() else text.strip()
+        if not stripped:
+            return text, None
+
+        clean_in = re.sub(r"[^a-z0-9\s]", "", stripped.lower()).strip()
+        for cq in cls.CANONICAL_QUESTIONS:
+            clean_cq = re.sub(r"[^a-z0-9\s]", "", cq.lower()).strip()
+            if clean_in == clean_cq:
+                return text, None
+
+        # Avoid overwriting already-clear technical/project entities not in phonetic noise
+        preserve_terms = (
+            "sql", "tableau", "primary key", "left join", "inner join", "normalization",
+            "data analytics", "careeros", "delinquency", "credit risk", "power bi", "power query", "dax",
+            "ride sharing", "engagement", "retention", "gdpr", "microservice", "saga", "cache invalidation",
+            "napoleon", "restaurant",
+        )
+        if any(pt in clean_in for pt in preserve_terms):
+            return text, None
+
+        def _strip_q_prefix(s: str) -> str:
+            return re.sub(
+                r"^(?:what\s+(?:is|are)\s+(?:meant\s+by\s+|the\s+|a\s+|an\s+)?|tell\s+me\s+about\s+(?:a\s+time\s+|your\s+)?|why\s+)",
+                "",
+                s,
+            ).strip()
+
+        in_prefix = clean_in.split()[0] if clean_in.split() else ""
+        in_subj = _strip_q_prefix(clean_in)
+
+        best_q = None
+        best_score = 0.0
+        for cq in cls.CANONICAL_QUESTIONS:
+            clean_cq = re.sub(r"[^a-z0-9\s]", "", cq.lower()).strip()
+            cq_prefix = clean_cq.split()[0] if clean_cq.split() else ""
+            if in_prefix and cq_prefix and in_prefix != cq_prefix:
+                continue
+            full_ratio = difflib.SequenceMatcher(None, clean_in, clean_cq).ratio()
+            cq_subj = _strip_q_prefix(clean_cq)
+            subj_ratio = difflib.SequenceMatcher(None, in_subj, cq_subj).ratio() if (in_subj and cq_subj) else full_ratio
+            if full_ratio >= 0.72 and subj_ratio >= 0.62 and full_ratio > best_score:
+                best_score = full_ratio
+                best_q = cq
+
+        if best_q:
+            return best_q, f"Transcript '{text}' phonetically matches '{best_q}'"
+        return text, None
+
 
 def normalize_query_entities(q: str) -> str:
     """Normalize phonetics/speech misrecognitions while strictly preserving distinct entities."""
@@ -985,6 +1277,20 @@ def extract_target_entity(query: str) -> Optional[EntityDefinition]:
         return KNOWN_TARGETS["Tableau"]
     if re.search(r"\bSQL\b", norm, flags=re.I):
         return KNOWN_TARGETS["SQL"]
+    if re.search(r"\bFastAPI\b", norm, flags=re.I):
+        return KNOWN_TARGETS["FastAPI"]
+    if re.search(r"\bJava Spring Boot\b|\bSpring Boot\b", norm, flags=re.I):
+        return KNOWN_TARGETS["Java Spring Boot"]
+    if re.search(r"\bRedis\b", norm, flags=re.I):
+        return KNOWN_TARGETS["Redis"]
+    if re.search(r"\bFlask\b", norm, flags=re.I):
+        return KNOWN_TARGETS["Flask"]
+    if re.search(r"\bReact\b", norm, flags=re.I):
+        return KNOWN_TARGETS["React"]
+    if re.search(r"\bEDA\b|\bExploratory Data Analysis\b", norm, flags=re.I):
+        return KNOWN_TARGETS["EDA"]
+    if re.search(r"\bDMX Technologies\b|\bDMX\b", norm, flags=re.I):
+        return KNOWN_TARGETS["DMX Technologies"]
     return None
 
 
@@ -1009,7 +1315,16 @@ ENTITY_CONTRADICTIONS: Dict[str, List[str]] = {
     ],
     "SQL": [
         "apparent power", "volt-ampere", "power va"
-    ]
+    ],
+    "Redis": [
+        "circle", "diameter", "geometry", "circumference"
+    ],
+    "React": [
+        "chemical", "inductor", "capacitor", "molecule"
+    ],
+    "Flask": [
+        "thermos", "laboratory"
+    ],
 }
 
 
@@ -1129,6 +1444,14 @@ def detect_topic_switch(new_type: InterviewType, new_question: str, state: Conve
 def build_answer_target(raw_transcript: str, cls: InterviewClassification, state: Optional[ConversationState] = None) -> AnswerTarget:
     """Builds structured AnswerTarget representing normalized question, entities, topics, and confidence."""
     norm_q, detected_entity, lexicon_conf = DomainLexicon.normalize_stt(raw_transcript)
+    recovered_q, recovery_hint = DomainLexicon.recover_closest_question(norm_q)
+    if recovery_hint and detected_entity is None:
+        norm_q = recovered_q
+    elif recovery_hint is None and norm_q.strip().lower() != raw_transcript.strip().lower():
+        _, recovery_hint = DomainLexicon.recover_closest_question(raw_transcript)
+        if recovery_hint is None:
+            recovery_hint = f"Transcript '{raw_transcript}' normalized to '{norm_q}'"
+
     target_ent = extract_target_entity(norm_q)
     entity_name = target_ent.name if target_ent else detected_entity
 
@@ -1205,6 +1528,7 @@ def build_answer_target(raw_transcript: str, cls: InterviewClassification, state
         entity_confidence=entity_conf,
         retrieval_confidence=retrieval_conf,
         validation_confidence=1.0,
+        recovery_hint=recovery_hint,
     )
 
 
@@ -1258,8 +1582,7 @@ NO_VERIFIED_STORY = "NO VERIFIED STORY FOUND. Use a real example from your exper
 FORBIDDEN_CANDIDATE_PROJECTS = ["careeros", "alphora", "fastapi", "redis", "trading bot", "trading project"]
 UNSUPPORTED_EXPERIENCE_PROMPTS = [
     "manager conflict", "conflict with your manager", "manager at your internship",
-    "$50m hardware", "500-person", "collective bargaining", "asic chips", "ios mobile",
-    "internship"
+    "$50m hardware", "500-person", "collective bargaining", "asic chips", "ios mobile"
 ]
 
 
@@ -1325,13 +1648,26 @@ def audit_hallucinations(answer_text: str, target: Any = None, entity_hint: Opti
             return AuditResult(False, HallucinationCategory.H3_WRONG_TECHNICAL_ENTITY, f"Contradiction: {contra}")
 
     # H4: Wrong employer/project in candidate context
+    norm_q_low = (target.normalized_question or "").lower()
+    raw_q_low = (target.raw_transcript or "").lower()
+    combined_q_low = f"{raw_q_low} {norm_q_low}"
     for fp in FORBIDDEN_CANDIDATE_PROJECTS:
         if fp in low:
+            if fp in ("fastapi", "redis") and (
+                target.interview_type == InterviewType.TECHNICAL
+                or target.resolved_interview_type == InterviewType.TECHNICAL
+                or fp in combined_q_low
+            ):
+                if not any(emp in low for emp in ("at deloitte", "at tata")):
+                    continue
             return AuditResult(False, HallucinationCategory.H4_WRONG_EMPLOYER_PROJECT, f"Forbidden project '{fp}' detected in candidate answer")
 
     # H1: Invented experience
-    q_low = target.raw_transcript.lower()
-    if any(unsupp in q_low for unsupp in UNSUPPORTED_EXPERIENCE_PROMPTS):
+    q_low = raw_q_low
+    has_unsupp = any(unsupp in q_low for unsupp in UNSUPPORTED_EXPERIENCE_PROMPTS)
+    if "internship" in q_low and "manager" in q_low and "dmx" not in combined_q_low:
+        has_unsupp = True
+    if has_unsupp:
         if not ("no verified story found" in low or "no grounded candidate story" in low or "no grounded" in low):
             return AuditResult(False, HallucinationCategory.H1_INVENTED_EXPERIENCE, "Invented unsupported candidate experience")
 
@@ -1425,9 +1761,11 @@ class GoogleInterviewContext:
         if intent in ("TECHNICAL", "QUANTITATIVE", "OTHER"):
             return []
 
-        # PROJECT questions: Retrieve Credit Risk / Delinquency Dashboard section
+        # PROJECT questions: Retrieve Credit Risk / Delinquency Dashboard section (plus Teamwork for DMX/internship)
         if intent == "PROJECT":
             matched = []
+            if ("dmx" in q or "internship" in q) and "Teamwork" in self.sections:
+                matched.append(self.sections["Teamwork"])
             if "Credit Risk / Delinquency Dashboard" in self.sections:
                 matched.append(self.sections["Credit Risk / Delinquency Dashboard"])
             if any(w in q for w in ("challenge", "limitation", "tradeoff", "next", "follow", "improve")) and "Follow-ups" in self.sections:
@@ -1719,6 +2057,19 @@ class SoundcardLoopbackListener:
         self._thread.start()
 
     def _capture_loop(self) -> None:
+        com_initialized = False
+        if sys.platform == "win32":
+            try:
+                import comtypes
+                comtypes.CoInitialize()
+                com_initialized = True
+            except Exception:
+                try:
+                    import ctypes
+                    ctypes.windll.ole32.CoInitialize(None)
+                    com_initialized = True
+                except Exception:
+                    pass
         block_samples = int(self.sample_rate * 0.03)  # 30ms blocks
         try:
             with self._mic.recorder(samplerate=self.sample_rate, channels=1) as rec:
@@ -1780,9 +2131,23 @@ class SoundcardLoopbackListener:
                                 logger.info(f"[QUESTION_DETECTION] ch={self.name} audio={len(full_audio)/16000:.2f}s -> DROPPED short speech (MIN_SPEECH_DURATION={MIN_SPEECH_DURATION}s)")
         except Exception as e:
             logger.error(f"SoundcardLoopback capture error: {e}", exc_info=True)
+        finally:
+            if com_initialized and sys.platform == "win32":
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    try:
+                        import ctypes
+                        ctypes.windll.ole32.CoUninitialize()
+                    except Exception:
+                        pass
 
     def stop(self) -> None:
         self.running = False
+
+
+SoundcardLoopback = SoundcardLoopbackListener
 
 # ---------------------------------------------------------------------------
 # 6. Streaming Transcription Worker (faster-whisper) with Hardware Selection
@@ -1847,6 +2212,14 @@ def create_whisper_model(
     return model, runtime_info
 
 
+WHISPER_INITIAL_PROMPT = (
+    "Interview questions on Data Analytics, Power BI, Power VA, Power Query, DAX, SQL, Python, "
+    "ETL, ELT, EDA, Exploratory Data Analysis, Tableau, Credit Risk, Delinquency Dashboard, "
+    "DMX Technologies, RGUKT, FastAPI, Django, Redis, React, Java Spring Boot, Flask, ARQ, "
+    "Google Data Analytics Apprenticeship, stakeholder presentation, trade-off."
+)
+
+
 class TranscriptionWorker(threading.Thread):
     """Processes partial audio cues and final speech turns via faster-whisper."""
 
@@ -1882,7 +2255,13 @@ class TranscriptionWorker(threading.Thread):
                     # Only do if audio_queue is not heavily backed up
                     if self.audio_queue.qsize() <= 2:
                         try:
-                            segments, _ = self.model.transcribe(audio_pcm, language="en", vad_filter=False, beam_size=1)
+                            segments, _ = self.model.transcribe(
+                                audio_pcm,
+                                language="en",
+                                vad_filter=False,
+                                beam_size=1,
+                                initial_prompt=WHISPER_INITIAL_PROMPT,
+                            )
                             partial_txt = " ".join(s.text.strip() for s in segments).strip()
                             if partial_txt:
                                 self.ui_queue.put(("partial_stt", f"{channel_name}: {partial_txt}..."))
@@ -1898,7 +2277,8 @@ class TranscriptionWorker(threading.Thread):
                     audio_pcm,
                     language="en",
                     vad_filter=False,
-                    beam_size=1
+                    beam_size=1,
+                    initial_prompt=WHISPER_INITIAL_PROMPT,
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
                 stt_latency_ms = (time.time() - t0) * 1000
@@ -1919,6 +2299,7 @@ class TranscriptionWorker(threading.Thread):
 # ---------------------------------------------------------------------------
 GCA_SYSTEM_PROMPT = """You are an executive GCA interview reasoning coach.
 Internally reason through: clarifying objective, decomposing, hypotheses, validation, and trade-offs. Express as natural spoken prose -- NEVER print labels like CLARIFY, FRAME, HYPOTHESES, OBJECTIVE, DECOMPOSITION.
+STT RECOVERY RULE: Input comes from live speech-to-text and may contain phonetic misrecognitions. Always infer and answer the closest sensible interview question in context, EXCEPT never confuse 'Power VA' (apparent power in volt-amperes) with 'Power BI'.
 
 MANDATORY OUTPUT FORMAT:
 You MUST start your response immediately with ANSWER: and end with FOLLOW-UP CUE:.
@@ -1936,13 +2317,15 @@ Match the question to an authentic story from [AUTHENTIC CANDIDATE STAR STORIES]
 STRICT RULES:
 1. NEVER fabricate companies, metrics, roles, projects, technologies, or achievements.
 2. CONTEXT AUDIT:
-- If a story in [AUTHENTIC CANDIDATE STAR STORIES] addresses the core challenge or scenario (e.g. database performance, Redis caching, license management, stepping up, schema migration), USE IT to construct your answer.
-- If NO relevant story exists in the context (e.g. enterprise sales, labor unions, mobile games, hardware procurement, chip design), output EXACTLY:
+- If a story in [AUTHENTIC CANDIDATE STAR STORIES] addresses the core challenge or scenario (e.g. database performance, Redis caching, license management, stepping up, schema migration, team disagreement, conflict resolution, priority/ownership alignment at DMX Technologies, data quality mistakes, stakeholder communication, competing deadlines), USE IT to construct your answer. For team disagreement or conflict questions, use the documented DMX Technologies team priority/ownership misalignment story from context; do NOT output NO VERIFIED STORY FOUND when the DMX Teamwork/Conflict story is present in context.
+- If NO relevant story exists in the context (e.g. enterprise sales, 500-person organizations, labor unions, collective bargaining, mobile games, hardware procurement, chip design, or conflict with a manager at an internship), output EXACTLY:
 NO VERIFIED STORY FOUND. Use a real example from your experience.
 3. If a relevant story is found, output ONLY:
 
 ANSWER:
 [Natural first-person spoken answer, 80-130 words: situation and task, 2-3 concrete actions YOU took, quantified result and lesson learned. No S:/T:/A:/R: labels.]
+
+STT RECOVERY RULE: Input comes from live speech-to-text and may contain phonetic misrecognitions. Always infer and answer the closest sensible interview question in context, EXCEPT never confuse 'Power VA' (apparent power in volt-amperes) with 'Power BI'.
 """
 
 TECHNICAL_SYSTEM_PROMPT = """You are a Staff Systems Architect interview coach.
@@ -1955,6 +2338,7 @@ Format strictly as 4 scannable cues for natural spoken delivery:
 
 TECHNICAL_ANSWER_PROMPT = """You are a senior engineer answering a direct technical interview question.
 Answer the question that was actually asked — do not restructure it into a design framework.
+STT RECOVERY RULE: Input comes from live speech-to-text and may contain phonetic misrecognitions. Always infer and answer the closest sensible interview question in context, EXCEPT never confuse 'Power VA' (apparent power in volt-amperes) with 'Power BI'.
 Output ONLY:
 
 ANSWER:
@@ -1985,6 +2369,7 @@ PERSONAL_SYSTEM_PROMPT = """You generate first-person interview answers about th
 ONLY in [CANDIDATE PROFILE & RESUME]. NEVER invent employers, projects, metrics, education, or timelines.
 If the provided context lacks the requested detail, answer with what IS verified and briefly note the
 candidate would elaborate from direct experience — do not fabricate specifics.
+STT RECOVERY RULE: Input comes from live speech-to-text and may contain phonetic misrecognitions. Always infer and answer the closest sensible interview question in context, EXCEPT never confuse 'Power VA' (apparent power in volt-amperes) with 'Power BI'.
 Output ONLY:
 
 ANSWER:
@@ -1995,6 +2380,7 @@ PROJECT_SYSTEM_PROMPT = """You answer project deep-dive questions about the cand
 ONLY in [PROJECT & CANDIDATE CONTEXT]. NEVER invent features, components, metrics, or decisions that are
 not in the context. If a detail is missing, say what you would verify or how you'd find out rather than
 inventing it.
+STT RECOVERY RULE: Input comes from live speech-to-text and may contain phonetic misrecognitions. Always infer and answer the closest sensible interview question in context, EXCEPT never confuse 'Power VA' (apparent power in volt-amperes) with 'Power BI'.
 Output ONLY:
 
 ANSWER:
@@ -2012,6 +2398,7 @@ ANSWER:
 GENERIC_ANSWER_PROMPT = """You are a concise interview assistant. Answer the question directly, honestly,
 and briefly in natural spoken language. If the question is ambiguous, state your assumption in one
 clause, then answer.
+STT RECOVERY RULE: Input comes from live speech-to-text and may contain phonetic misrecognitions. Always infer and answer the closest sensible interview question in context, EXCEPT never confuse 'Power VA' (apparent power in volt-amperes) with 'Power BI'.
 Output ONLY:
 
 ANSWER:
@@ -2214,9 +2601,15 @@ class LLMStreamingWorker(threading.Thread):
                 self.ui_queue.put(("clear_text", None))
                 self.ui_queue.put(("intent_badge", intent))
 
+                effective_question = (
+                    target.normalized_question
+                    if (target and target.normalized_question and "-> Follow-up:" not in current_question)
+                    else current_question
+                )
+
                 # QUANTITATIVE short-circuit: deterministic answer, zero LLM latency
                 if intent == "QUANTITATIVE":
-                    det = quant_answer(current_question)
+                    det = quant_answer(effective_question) or quant_answer(current_question)
                     if det is not None:
                         logger.info(f"[SEPARATION] deterministic quantitative answer (no LLM): {det}")
                         telemetry.mark_llm_request_sent()
@@ -2234,31 +2627,33 @@ class LLMStreamingWorker(threading.Thread):
                 # Retrieval phase — reuse speculative prep when final transcript validates it
                 top_chunks = None
                 spec = self.spec_worker.get_state() if self.spec_worker else None
-                if spec and spec.get("intent") == intent and spec_matches(current_question, spec.get("text", "")):
+                if spec and spec.get("intent") == intent and spec_matches(effective_question, spec.get("text", "")):
                     top_chunks = spec["chunks"]
                     telemetry.spec_reused = True
                     telemetry.spec_prep_ms = spec.get("prep_ms", 0.0)
-                    logger.info(f"[Spec] Reused speculative retrieval (prep {telemetry.spec_prep_ms:.1f}ms) for: '{current_question[:50]}'")
+                    logger.info(f"[Spec] Reused speculative retrieval (prep {telemetry.spec_prep_ms:.1f}ms) for: '{effective_question[:50]}'")
                 if top_chunks is None:
-                    top_chunks = self.chunker.get_top_k(current_question, intent=intent, k=RETRIEVAL_TOP_K)
-                logger.info(f"[RETRIEVAL] intent={intent} chunks={len(top_chunks)} spec_reused={telemetry.spec_reused} query='{current_question[:70]}'")
+                    top_chunks = self.chunker.get_top_k(effective_question, intent=intent, k=RETRIEVAL_TOP_K)
+                logger.info(f"[RETRIEVAL] intent={intent} chunks={len(top_chunks)} spec_reused={telemetry.spec_reused} query='{effective_question[:70]}'")
                 if self.spec_worker:
                     self.spec_worker.clear()
                 telemetry.mark_retrieval_done()
 
                 context_str = "\n\n---\n\n".join(top_chunks) if top_chunks else "No specific documents provided."
+                if target and getattr(target, "recovery_hint", None):
+                    context_str = f"{context_str}\n\n[STT Recovery Note: {target.recovery_hint}]"
 
                 # Select specialized prompt based on interview type with answer planning and dynamic length
                 effective_type = target.resolved_interview_type or (InterviewType(intent) if intent in [e.value for e in InterviewType] else InterviewType.OTHER)
                 plan_str = get_answer_plan(effective_type, target.topic)
-                min_w, max_w, len_cat = get_target_length(effective_type, current_question)
+                min_w, max_w, len_cat = get_target_length(effective_type, effective_question)
                 length_str = f"[TARGET LENGTH: {len_cat} ({min_w}-{max_w} words)]"
 
-                target_entity = target.target_entity or extract_target_entity(current_question)
+                target_entity = target.target_entity or extract_target_entity(effective_question)
                 if intent == "BEHAVIORAL":
                     sys_prompt = f"{BEHAVIORAL_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[AUTHENTIC CANDIDATE STAR STORIES]\n{context_str}"
                 elif intent == "TECHNICAL":
-                    tech_prompt = build_technical_prompt(current_question, target_entity)
+                    tech_prompt = build_technical_prompt(effective_question, target_entity)
                     sys_prompt = f"{tech_prompt}\n\n{plan_str}\n{length_str}\n\n[REFERENCE NOTES]\n{context_str}"
                 elif intent == "PERSONAL":
                     sys_prompt = f"{PERSONAL_SYSTEM_PROMPT}\n\n{plan_str}\n{length_str}\n\n[CANDIDATE PROFILE & RESUME]\n{context_str}"
@@ -2273,12 +2668,17 @@ class LLMStreamingWorker(threading.Thread):
 
                 messages = [{"role": "system", "content": sys_prompt}]
                 sliced_history = history[-HISTORY_TURNS:]
-                for speaker, text in sliced_history:
+                for idx_h, (speaker, text) in enumerate(sliced_history):
                     role = "user" if speaker == "Interviewer" else "assistant"
-                    messages.append({"role": role, "content": text})
+                    msg_txt = (
+                        effective_question
+                        if (idx_h == len(sliced_history) - 1 and role == "user" and text == current_question)
+                        else text
+                    )
+                    messages.append({"role": role, "content": msg_txt})
 
-                if not sliced_history or sliced_history[-1][1] != current_question:
-                    messages.append({"role": "user", "content": current_question})
+                if not sliced_history or sliced_history[-1][1] not in (current_question, effective_question):
+                    messages.append({"role": "user", "content": effective_question})
 
                 groq_key = os.getenv("GROQ_API_KEY", "").strip()
                 nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
@@ -2624,6 +3024,267 @@ class DialogueManager(threading.Thread):
 # ---------------------------------------------------------------------------
 # 10. Frameless Webcam Teleprompter Overlay & UI Controls
 # ---------------------------------------------------------------------------
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+WDA_NONE = 0x00000000
+WDA_MONITOR = 0x00000001
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+def apply_window_stealth(window_or_hwnd: Any) -> bool:
+    """Applies Win32 screen-capture exclusion (WDA_EXCLUDEFROMCAPTURE) and toolwindow extended
+    styles (WS_EX_TOOLWINDOW & ~WS_EX_APPWINDOW) so the overlay is invisible to screen sharing,
+    Alt+Tab, taskbar, and window pickers."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        if hasattr(window_or_hwnd, "update_idletasks"):
+            try:
+                window_or_hwnd.update_idletasks()
+            except Exception:
+                pass
+        raw_hwnd = int(window_or_hwnd.winfo_id()) if hasattr(window_or_hwnd, "winfo_id") else int(window_or_hwnd)
+        if not raw_hwnd:
+            return False
+
+        user32 = ctypes.windll.user32
+        hwnd = int(user32.GetParent(raw_hwnd) or raw_hwnd)
+
+        get_long = getattr(user32, "GetWindowLongPtrW", getattr(user32, "GetWindowLongW", None))
+        set_long = getattr(user32, "SetWindowLongPtrW", getattr(user32, "SetWindowLongW", None))
+
+        for target_h in ({hwnd, raw_hwnd} if hwnd != raw_hwnd else {hwnd}):
+            if get_long and set_long:
+                try:
+                    ex_style = int(get_long(target_h, GWL_EXSTYLE))
+                    new_style = (ex_style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+                    set_long(target_h, GWL_EXSTYLE, new_style)
+                except Exception:
+                    pass
+
+        ok = bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+        if not ok:
+            user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
+        if raw_hwnd != hwnd:
+            try:
+                user32.SetWindowDisplayAffinity(raw_hwnd, WDA_EXCLUDEFROMCAPTURE)
+            except Exception:
+                pass
+
+        affinity = ctypes.c_ulong(0)
+        user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity))
+        return bool(affinity.value in (WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR))
+    except Exception as e:
+        logger.debug(f"Screen capture stealth skipped: {e}")
+        return False
+
+
+class DocumentViewerEngine:
+    """In-memory stealth document & PDF viewer engine supporting .pdf, .md, and .txt files
+    without invoking any OS file dialog or external viewer window."""
+
+    SUPPORTED_EXTS = (".pdf", ".md", ".txt")
+
+    def __init__(self, docs_dir: Path = DOCS_DIR, workspace_dir: Path = WORKSPACE_DIR):
+        self.docs_dir = Path(docs_dir)
+        self.workspace_dir = Path(workspace_dir)
+        self.documents: List[Path] = []
+        self.current_doc_path: Optional[Path] = None
+        self.current_doc_index: int = 0
+        self.pages: List[str] = ["No document loaded."]
+        self.current_page: int = 0
+        self.search_matches: List[Tuple[int, str]] = []
+        self.current_match_idx: int = -1
+        self.list_documents()
+        if self.documents:
+            self.load_document(self.documents[0])
+
+    def list_documents(self) -> List[Path]:
+        found: List[Path] = []
+        seen = set()
+
+        for candidate_ctx in (Path(__file__).resolve().parent / "context.md", self.workspace_dir / "context.md"):
+            try:
+                if candidate_ctx.is_file():
+                    res = candidate_ctx.resolve()
+                    if res not in seen:
+                        seen.add(res)
+                        found.append(candidate_ctx)
+            except Exception:
+                pass
+
+        if self.docs_dir.exists():
+            for p in sorted(self.docs_dir.iterdir(), key=lambda x: x.name.lower()):
+                try:
+                    if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTS:
+                        res = p.resolve()
+                        if res not in seen:
+                            seen.add(res)
+                            found.append(p)
+                except Exception:
+                    pass
+
+        self.documents = found
+        return list(self.documents)
+
+    def load_document(self, path: Union[str, Path]) -> Dict[str, Any]:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Document not found: {p}")
+
+        ext = p.suffix.lower()
+        pages: List[str] = []
+        if ext == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(str(p))
+            for idx, page in enumerate(reader.pages):
+                try:
+                    txt = (page.extract_text() or "").strip()
+                except Exception:
+                    txt = ""
+                pages.append(txt if txt else f"[Page {idx + 1}: No extractable text]")
+            if not pages:
+                pages = ["[Empty PDF document]"]
+        else:
+            raw = p.read_text(encoding="utf-8", errors="ignore")
+            if "\n## " in raw:
+                parts = raw.split("\n## ")
+                for idx, part in enumerate(parts):
+                    chunk = part.strip() if idx == 0 else f"## {part.strip()}"
+                    if chunk:
+                        if len(chunk) <= 1800:
+                            pages.append(chunk)
+                        else:
+                            for start in range(0, len(chunk), 1800):
+                                pages.append(chunk[start:start + 1800])
+            else:
+                text_clean = raw.strip()
+                if text_clean:
+                    for start in range(0, len(text_clean), 1800):
+                        pages.append(text_clean[start:start + 1800])
+            if not pages:
+                pages = ["[Empty document]"]
+
+        self.pages = pages
+        self.current_doc_path = p
+        self.current_page = 0
+        self.search_matches = []
+        self.current_match_idx = -1
+
+        self.list_documents()
+        for i, doc_p in enumerate(self.documents):
+            try:
+                if doc_p.resolve() == p.resolve():
+                    self.current_doc_index = i
+                    break
+            except Exception:
+                if doc_p == p:
+                    self.current_doc_index = i
+                    break
+
+        return {
+            "title": p.name,
+            "path": str(p),
+            "total_pages": len(self.pages),
+            "page": 1,
+            "content": self.pages[0],
+        }
+
+    def get_page(self, page_idx: int) -> Tuple[int, int, str]:
+        if not self.pages:
+            self.pages = ["No document loaded."]
+        clamped = max(0, min(len(self.pages) - 1, int(page_idx)))
+        self.current_page = clamped
+        return self.current_page + 1, len(self.pages), self.pages[self.current_page]
+
+    def next_page(self) -> Tuple[int, int, str]:
+        if self.current_page + 1 < len(self.pages):
+            self.current_page += 1
+        return self.get_page(self.current_page)
+
+    def prev_page(self) -> Tuple[int, int, str]:
+        if self.current_page > 0:
+            self.current_page -= 1
+        return self.get_page(self.current_page)
+
+    def next_document(self) -> Dict[str, Any]:
+        docs = self.list_documents()
+        if not docs:
+            return {"title": "None", "path": "", "total_pages": 1, "page": 1, "content": "No documents available."}
+        self.current_doc_index = (self.current_doc_index + 1) % len(docs)
+        return self.load_document(docs[self.current_doc_index])
+
+    def prev_document(self) -> Dict[str, Any]:
+        docs = self.list_documents()
+        if not docs:
+            return {"title": "None", "path": "", "total_pages": 1, "page": 1, "content": "No documents available."}
+        self.current_doc_index = (self.current_doc_index - 1) % len(docs)
+        return self.load_document(docs[self.current_doc_index])
+
+    def search(self, query: str) -> List[Tuple[int, str]]:
+        q = (query or "").strip().lower()
+        self.search_matches = []
+        self.current_match_idx = -1
+        if not q:
+            return []
+        for idx, page_txt in enumerate(self.pages):
+            low = page_txt.lower()
+            pos = low.find(q)
+            if pos != -1:
+                start = max(0, pos - 40)
+                end = min(len(page_txt), pos + len(q) + 60)
+                snippet = page_txt[start:end].replace("\n", " ").strip()
+                self.search_matches.append((idx + 1, snippet))
+        if self.search_matches:
+            self.current_match_idx = 0
+            self.current_page = self.search_matches[0][0] - 1
+        return list(self.search_matches)
+
+    def next_search_match(self) -> Optional[Tuple[int, int, str]]:
+        if not self.search_matches:
+            return None
+        self.current_match_idx = (self.current_match_idx + 1) % len(self.search_matches)
+        target_page_1based = self.search_matches[self.current_match_idx][0]
+        return self.get_page(target_page_1based - 1)
+
+    def import_file(self, file_path: Union[str, Path]) -> Path:
+        src = Path(str(file_path).strip().strip('"').strip("'"))
+        if not src.exists() or not src.is_file():
+            raise FileNotFoundError(f"File does not exist: {src}")
+        if src.suffix.lower() not in self.SUPPORTED_EXTS:
+            raise ValueError(f"Unsupported file extension '{src.suffix}'. Supported: {self.SUPPORTED_EXTS}")
+        self.docs_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.docs_dir / src.name
+        try:
+            if src.resolve() != dest.resolve():
+                shutil.copy2(src, dest)
+        except Exception:
+            shutil.copy2(src, dest)
+        self.list_documents()
+        self.load_document(dest)
+        return dest
+
+    def list_import_candidates(self, search_dir: Optional[Path] = None) -> List[Path]:
+        dirs = [Path(search_dir)] if search_dir else [DOWNLOADS_DIR, self.workspace_dir, Path(__file__).resolve().parent]
+        candidates: List[Path] = []
+        seen = set()
+        for d in dirs:
+            if not d or not d.exists():
+                continue
+            try:
+                for p in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+                    if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTS:
+                        res = p.resolve()
+                        if res not in seen:
+                            seen.add(res)
+                            candidates.append(p)
+            except Exception:
+                pass
+        return candidates
+
+
 class TeleprompterOverlay:
     """Semi-transparent, top-aligned, screen-share cloaked teleprompter window."""
 
@@ -2651,22 +3312,19 @@ class TeleprompterOverlay:
         self.root.wm_attributes("-alpha", 0.92)
         self.root.configure(bg=self.bg_color)
 
-        # Windows screen-share cloaking (WDA_EXCLUDEFROMCAPTURE = 0x00000011)
-        try:
-            import ctypes
-            self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
-        except Exception as e:
-            logger.debug(f"Screen capture affinity skipped: {e}")
-
         # Geometry: 820x220 top-aligned beneath webcam
-        window_width = 820
-        window_height = 220
+        self.window_width = 820
+        self.compact_height = 220
+        self.expanded_height = 440
+        self.is_expanded = False
         screen_width = self.root.winfo_screenwidth()
-        pos_x = (screen_width - window_width) // 2
+        pos_x = (screen_width - self.window_width) // 2
         pos_y = 8
-        self.root.geometry(f"{window_width}x{window_height}+{pos_x}+{pos_y}")
+        self.root.geometry(f"{self.window_width}x{self.compact_height}+{pos_x}+{pos_y}")
+
+        # Windows screen-share & Alt+Tab stealth cloaking
+        self.stealth_active = apply_window_stealth(self.root)
+        self.root.bind("<Map>", lambda _e: self._reapply_stealth())
 
         # Dragging handlers for repositioning
         self._drag_start_x = 0
@@ -2687,6 +3345,15 @@ class TeleprompterOverlay:
             fg=self.accent_color
         )
         self.status_label.pack(side=tk.LEFT, padx=(8, 4))
+
+        self.stealth_label = tk.Label(
+            header_frame,
+            text="🔒 STEALTH",
+            font=("Segoe UI", 8, "bold"),
+            bg="#252525",
+            fg="#00E676" if self.stealth_active else "#FFA726"
+        )
+        self.stealth_label.pack(side=tk.LEFT, padx=3)
 
         self.intent_label = tk.Label(
             header_frame,
@@ -2715,7 +3382,8 @@ class TeleprompterOverlay:
         )
         self.telemetry_label.pack(side=tk.LEFT, padx=6)
 
-        doc_count = len(list(DOCS_DIR.glob("*")))
+        self.doc_engine = DocumentViewerEngine(docs_dir=DOCS_DIR, workspace_dir=WORKSPACE_DIR)
+        doc_count = len(self.doc_engine.list_documents())
         self.doc_count_label = tk.Label(
             header_frame,
             text=f"Docs: {doc_count}",
@@ -2791,6 +3459,22 @@ class TeleprompterOverlay:
         )
         self.upload_btn.pack(side=tk.RIGHT, padx=3, pady=2)
 
+        self.docs_btn = tk.Button(
+            header_frame,
+            text="📄 Docs",
+            command=self.toggle_doc_viewer,
+            font=("Segoe UI", 8, "bold"),
+            bg="#263238",
+            fg="#80CBC4",
+            activebackground="#37474f",
+            activeforeground="#E0F2F1",
+            bd=0,
+            padx=6,
+            pady=1,
+            cursor="hand2"
+        )
+        self.docs_btn.pack(side=tk.RIGHT, padx=3, pady=2)
+
         self.mic_role_btn = tk.Button(
             header_frame,
             text="🎤 Mic→Cand",
@@ -2824,20 +3508,140 @@ class TeleprompterOverlay:
             tk.END,
             "● Ready. Listening for interviewer questions...\n"
             "• GCA frameworks & authentic STAR stories stream here in real time.\n"
-            "• Controls: [Ctrl+Shift+T: Test | +P: Pause | +C: Clear | +H: Hide]"
+            "• Controls: [Ctrl+Shift+T: Test | +P: Pause | +C: Clear | +H: Hide | +D: Docs]"
         )
         self.text_widget.configure(state=tk.DISABLED)
+
+        # In-Built Stealth PDF/Document Viewer Panel (initially hidden)
+        self.doc_viewer_visible = False
+        self.import_drawer_visible = False
+        self.doc_panel_frame = tk.Frame(self.root, bg="#141414", bd=1, relief=tk.FLAT)
+
+        doc_ctrl_bar = tk.Frame(self.doc_panel_frame, bg="#1f1f1f", height=26)
+        doc_ctrl_bar.pack(fill=tk.X, side=tk.TOP)
+
+        self.prev_doc_btn = tk.Button(
+            doc_ctrl_bar, text="◀ Doc", command=self.prev_doc,
+            font=("Segoe UI", 8), bg="#2c2c2c", fg="#90caf9", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.prev_doc_btn.pack(side=tk.LEFT, padx=(4, 2), pady=2)
+
+        self.doc_title_label = tk.Label(
+            doc_ctrl_bar, text="context.md", font=("Segoe UI", 8, "bold"),
+            bg="#1f1f1f", fg="#80CBC4", width=20, anchor="w"
+        )
+        self.doc_title_label.pack(side=tk.LEFT, padx=2)
+
+        self.next_doc_btn = tk.Button(
+            doc_ctrl_bar, text="Doc ▶", command=self.next_doc,
+            font=("Segoe UI", 8), bg="#2c2c2c", fg="#90caf9", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.next_doc_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self.prev_page_btn = tk.Button(
+            doc_ctrl_bar, text="◀ Pg", command=self.prev_doc_page,
+            font=("Segoe UI", 8), bg="#2c2c2c", fg="#e0e0e0", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.prev_page_btn.pack(side=tk.LEFT, padx=(6, 2), pady=2)
+
+        self.doc_page_label = tk.Label(
+            doc_ctrl_bar, text="Pg 1/1", font=("Segoe UI", 8),
+            bg="#1f1f1f", fg="#ffb74d"
+        )
+        self.doc_page_label.pack(side=tk.LEFT, padx=3)
+
+        self.next_page_btn = tk.Button(
+            doc_ctrl_bar, text="Pg ▶", command=self.next_doc_page,
+            font=("Segoe UI", 8), bg="#2c2c2c", fg="#e0e0e0", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.next_page_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self.doc_search_entry = tk.Entry(
+            doc_ctrl_bar, font=("Segoe UI", 8), bg="#262626", fg="#ffffff",
+            insertbackground="#ffffff", width=16, bd=1, relief=tk.FLAT
+        )
+        self.doc_search_entry.pack(side=tk.LEFT, padx=(8, 2), pady=2)
+        self.doc_search_entry.bind("<Return>", lambda _e: self.search_in_doc())
+
+        self.doc_find_btn = tk.Button(
+            doc_ctrl_bar, text="Find", command=self.search_in_doc,
+            font=("Segoe UI", 8), bg="#37474f", fg="#ffd54f", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.doc_find_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+        self.expand_doc_btn = tk.Button(
+            doc_ctrl_bar, text="↕ Expand", command=self.toggle_expand_height,
+            font=("Segoe UI", 8), bg="#2c2c2c", fg="#b0bec5", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.expand_doc_btn.pack(side=tk.RIGHT, padx=3, pady=2)
+
+        self.import_toggle_btn = tk.Button(
+            doc_ctrl_bar, text="📂 Import", command=self.toggle_import_drawer,
+            font=("Segoe UI", 8), bg="#1e3a5f", fg="#90caf9", bd=0, padx=5, pady=1, cursor="hand2"
+        )
+        self.import_toggle_btn.pack(side=tk.RIGHT, padx=3, pady=2)
+
+        # Embedded stealth import drawer (never opens OS dialog)
+        self.import_drawer_frame = tk.Frame(self.doc_panel_frame, bg="#1c2630")
+        tk.Label(
+            self.import_drawer_frame, text="Path:", font=("Segoe UI", 8),
+            bg="#1c2630", fg="#90caf9"
+        ).pack(side=tk.LEFT, padx=(6, 2), pady=2)
+
+        self.import_path_entry = tk.Entry(
+            self.import_drawer_frame, font=("Segoe UI", 8), bg="#12181f", fg="#ffffff",
+            insertbackground="#ffffff", width=36, bd=1, relief=tk.FLAT
+        )
+        self.import_path_entry.pack(side=tk.LEFT, padx=2, pady=2)
+        self.import_path_entry.bind("<Return>", lambda _e: self._import_from_entry())
+
+        self.import_confirm_btn = tk.Button(
+            self.import_drawer_frame, text="Import File", command=self._import_from_entry,
+            font=("Segoe UI", 8, "bold"), bg="#2e7d32", fg="#ffffff", bd=0, padx=6, pady=1, cursor="hand2"
+        )
+        self.import_confirm_btn.pack(side=tk.LEFT, padx=3, pady=2)
+
+        self.import_candidates_frame = tk.Frame(self.import_drawer_frame, bg="#1c2630")
+        self.import_candidates_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        # Scrollable document reader text widget
+        self.doc_text_widget = tk.Text(
+            self.doc_panel_frame,
+            bg="#141414",
+            fg="#E0E0E0",
+            font=("Consolas", 9),
+            wrap=tk.WORD,
+            bd=0,
+            padx=10,
+            pady=6,
+            height=8,
+            highlightthickness=0
+        )
+        self.doc_text_widget.tag_configure("doc_search_hit", background="#FFB300", foreground="#111111")
+        self.doc_text_widget.pack(fill=tk.BOTH, expand=True)
+        self._render_current_doc_page()
 
         self.is_hidden = False
         self.is_paused = False
 
         self.root.after(30, self._process_ui_queue)
 
+    def _reapply_stealth(self) -> None:
+        self.stealth_active = apply_window_stealth(self.root)
+        try:
+            self.stealth_label.configure(fg="#00E676" if self.stealth_active else "#FFA726")
+        except Exception:
+            pass
+
     def _start_drag(self, event) -> None:
+        if event.widget in (self.doc_search_entry, self.import_path_entry):
+            return
         self._drag_start_x = event.x
         self._drag_start_y = event.y
 
     def _on_drag(self, event) -> None:
+        if event.widget in (self.doc_search_entry, self.import_path_entry):
+            return
         x = self.root.winfo_x() + (event.x - self._drag_start_x)
         y = self.root.winfo_y() + (event.y - self._drag_start_y)
         self.root.geometry(f"+{x}+{y}")
@@ -2846,33 +3650,140 @@ class TeleprompterOverlay:
         if self.is_hidden:
             self.root.deiconify()
             self.is_hidden = False
+            self._reapply_stealth()
         else:
             self.root.withdraw()
             self.is_hidden = True
 
-    def upload_document(self) -> None:
-        try:
-            file_path = filedialog.askopenfilename(
-                initialdir=str(DOWNLOADS_DIR),
-                title="Select Reference Document",
-                filetypes=[
-                    ("Supported Docs", "*.pdf;*.txt;*.md"),
-                    ("PDFs", "*.pdf"),
-                    ("Text & Markdown", "*.txt;*.md"),
-                    ("All Files", "*.*")
-                ]
+    def toggle_expand_height(self) -> None:
+        self.is_expanded = not self.is_expanded
+        target_h = self.expanded_height if self.is_expanded else self.compact_height
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        self.root.geometry(f"{self.window_width}x{target_h}+{x}+{y}")
+        self.expand_doc_btn.configure(text="↕ Compact" if self.is_expanded else "↕ Expand")
+        self._reapply_stealth()
+
+    def toggle_doc_viewer(self) -> None:
+        self.doc_viewer_visible = not self.doc_viewer_visible
+        if self.doc_viewer_visible:
+            if not self.is_expanded:
+                self.toggle_expand_height()
+            self.doc_panel_frame.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM)
+            self.docs_btn.configure(bg="#00695C", fg="#FFFFFF")
+            self._render_current_doc_page()
+        else:
+            self.doc_panel_frame.pack_forget()
+            self.docs_btn.configure(bg="#263238", fg="#80CBC4")
+            if self.is_expanded:
+                self.toggle_expand_height()
+        self._reapply_stealth()
+
+    def toggle_import_drawer(self) -> None:
+        self.import_drawer_visible = not self.import_drawer_visible
+        if self.import_drawer_visible:
+            self._refresh_import_candidates()
+            self.import_drawer_frame.pack(fill=tk.X, side=tk.TOP, before=self.doc_text_widget)
+        else:
+            self.import_drawer_frame.pack_forget()
+
+    def _refresh_import_candidates(self) -> None:
+        for child in self.import_candidates_frame.winfo_children():
+            child.destroy()
+        candidates = self.doc_engine.list_import_candidates()[:4]
+        for cand in candidates:
+            btn = tk.Button(
+                self.import_candidates_frame,
+                text=f"+ {cand.name[:18]}",
+                command=lambda p=cand: self.upload_document(p),
+                font=("Segoe UI", 7),
+                bg="#263238",
+                fg="#80CBC4",
+                bd=0,
+                padx=4,
+                pady=1,
+                cursor="hand2"
             )
-            if file_path:
-                src = Path(file_path)
-                dest = DOCS_DIR / src.name
-                shutil.copy2(src, dest)
-                self.chunker.load_and_index()
-                doc_count = len(list(DOCS_DIR.glob("*")))
-                self.doc_count_label.configure(text=f"Docs: {doc_count}")
-                self.append_token(f"\n[✓ Indexed document: '{src.name}' ({len(self.chunker.chunks)} total chunks)]\n")
+            btn.pack(side=tk.LEFT, padx=2, pady=1)
+
+    def _import_from_entry(self) -> None:
+        raw_p = self.import_path_entry.get().strip()
+        if raw_p:
+            self.upload_document(raw_p)
+
+    def _render_current_doc_page(self, highlight_query: str = "") -> None:
+        page_num, total_pages, content = self.doc_engine.get_page(self.doc_engine.current_page)
+        title = self.doc_engine.current_doc_path.name if self.doc_engine.current_doc_path else "No Doc"
+        self.doc_title_label.configure(text=title[:22])
+        self.doc_page_label.configure(text=f"Pg {page_num}/{total_pages}")
+
+        self.doc_text_widget.configure(state=self.tk.NORMAL)
+        self.doc_text_widget.delete("1.0", self.tk.END)
+        self.doc_text_widget.insert(self.tk.END, content)
+
+        q = (highlight_query or self.doc_search_entry.get() or "").strip()
+        if q:
+            start_idx = "1.0"
+            while True:
+                pos = self.doc_text_widget.search(q, start_idx, stopindex=self.tk.END, nocase=True)
+                if not pos:
+                    break
+                end_pos = f"{pos}+{len(q)}c"
+                self.doc_text_widget.tag_add("doc_search_hit", pos, end_pos)
+                start_idx = end_pos
+
+        self.doc_text_widget.configure(state=self.tk.DISABLED)
+
+    def next_doc_page(self) -> None:
+        self.doc_engine.next_page()
+        self._render_current_doc_page()
+
+    def prev_doc_page(self) -> None:
+        self.doc_engine.prev_page()
+        self._render_current_doc_page()
+
+    def next_doc(self) -> None:
+        self.doc_engine.next_document()
+        self._render_current_doc_page()
+
+    def prev_doc(self) -> None:
+        self.doc_engine.prev_document()
+        self._render_current_doc_page()
+
+    def search_in_doc(self, query: Optional[str] = None) -> List[Tuple[int, str]]:
+        q = (query if query is not None else self.doc_search_entry.get()).strip()
+        if not q:
+            self._render_current_doc_page("")
+            return []
+        if self.doc_engine.search_matches and q.lower() == getattr(self, "_last_search_q", "").lower():
+            self.doc_engine.next_search_match()
+        else:
+            self._last_search_q = q
+            self.doc_engine.search(q)
+        self._render_current_doc_page(q)
+        return self.doc_engine.search_matches
+
+    def upload_document(self, file_path: Optional[Union[str, Path]] = None) -> Optional[Path]:
+        """Stealth in-overlay document import & indexing without opening OS modal dialogs."""
+        if file_path is None:
+            if not self.doc_viewer_visible:
+                self.toggle_doc_viewer()
+            if not self.import_drawer_visible:
+                self.toggle_import_drawer()
+            return None
+
+        try:
+            dest = self.doc_engine.import_file(file_path)
+            self.chunker.load_and_index()
+            doc_count = len(self.doc_engine.list_documents())
+            self.doc_count_label.configure(text=f"Docs: {doc_count}")
+            self._render_current_doc_page()
+            self.append_token(f"\n[✓ Stealth-indexed document: '{dest.name}' ({len(self.doc_engine.pages)} pages)]\n")
+            return dest
         except Exception as e:
-            logger.error(f"Failed to upload document: {e}")
-            messagebox.showerror("Upload Error", f"Could not index document: {e}")
+            logger.error(f"Failed to import document: {e}")
+            self.append_token(f"\n[⚠ Import error: {e}]\n")
+            return None
 
     def toggle_pause(self) -> None:
         self.is_paused = not self.is_paused
@@ -3443,7 +4354,8 @@ def main():
         keyboard.add_hotkey("ctrl+shift+p", overlay.toggle_pause)
         keyboard.add_hotkey("ctrl+shift+c", overlay.clear_overlay)
         keyboard.add_hotkey("ctrl+shift+t", trigger_test_question)
-        logger.info("Global hotkeys: Ctrl+Shift+H (Hide), +P (Pause), +C (Clear), +T (Test)")
+        keyboard.add_hotkey("ctrl+shift+d", lambda: overlay.root.after(0, overlay.toggle_doc_viewer))
+        logger.info("Global hotkeys: Ctrl+Shift+H (Hide), +P (Pause), +C (Clear), +T (Test), +D (Docs)")
     except Exception as e:
         logger.warning(f"Failed registering global hotkeys via 'keyboard' ({e}).")
 

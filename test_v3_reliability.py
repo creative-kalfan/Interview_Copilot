@@ -419,6 +419,218 @@ def test_18_telemetry_preservation():
     return True
 
 
+def test_19_misheard_stt_and_closest_question_recovery():
+    print("\n--- Test 19: Misheard STT & Closest Question Recovery ---")
+    # 1. Radius -> Redis vs geometry guard
+    norm_rad, ent_rad, _ = DomainLexicon.normalize_stt("What is the radius?")
+    assert "Redis" in norm_rad and ent_rad == "Redis", f"Expected Redis, got: {norm_rad}, {ent_rad}"
+    assert copilot.IntentClassifier.classify("What is the radius?") == "TECHNICAL"
+    norm_circle, ent_circle, _ = DomainLexicon.normalize_stt("What is the radius of a circle?")
+    assert "Redis" not in norm_circle and ent_circle != "Redis", f"Geometry radius wrongly converted: {norm_circle}"
+
+    # 2. First API -> FastAPI
+    norm_fapi, ent_fapi, _ = DomainLexicon.normalize_stt("What is first API?")
+    assert "FastAPI" in norm_fapi and ent_fapi == "FastAPI", f"Expected FastAPI, got: {norm_fapi}, {ent_fapi}"
+
+    # 3. Reaction / Reactance -> React vs chemistry guard
+    for phrase in ("What is the reaction?", "What is reactance?"):
+        norm_r, ent_r, _ = DomainLexicon.normalize_stt(phrase)
+        assert "React" in norm_r and ent_r == "React", f"Expected React for '{phrase}', got: {norm_r}, {ent_r}"
+    norm_chem, ent_chem, _ = DomainLexicon.normalize_stt("What is a chemical reaction?")
+    assert "React" not in norm_chem.split() and ent_chem != "React", f"Chemical reaction wrongly converted: {norm_chem}"
+
+    # 4. Java Springbook / Javas Priak -> Java Spring Boot
+    for phrase in ("What is meant by Java Springbook?", "What is meant by Javas Priak?"):
+        norm_sb, ent_sb, _ = DomainLexicon.normalize_stt(phrase)
+        assert "Java Spring Boot" in norm_sb and ent_sb == "Java Spring Boot", f"Failed Spring Boot for '{phrase}': {norm_sb}"
+
+    # 5. What is it last? -> What is Flask
+    norm_fl, ent_fl, _ = DomainLexicon.normalize_stt("What is it last?")
+    assert "What is Flask" in norm_fl and ent_fl == "Flask", f"Expected Flask, got: {norm_fl}, {ent_fl}"
+
+    # 6. What is meant by ETA? / LDA? -> EDA
+    for phrase in ("What is meant by ETA?", "What is meant by LDA?"):
+        norm_eda, ent_eda, _ = DomainLexicon.normalize_stt(phrase)
+        assert "EDA" in norm_eda and ent_eda == "EDA", f"Expected EDA for '{phrase}', got: {norm_eda}, {ent_eda}"
+
+    # 7. Hi, tell me about your sin. -> tell me about yourself -> PERSONAL
+    sin_q = "Hi, tell me about your sin."
+    assert _looks_like_question(sin_q) is True
+    norm_sin, _, _ = DomainLexicon.normalize_stt(sin_q)
+    assert "tell me about yourself" in norm_sin.lower(), f"Expected tell me about yourself, got: {norm_sin}"
+    cls_sin = copilot.ISRE.classify(sin_q)
+    assert cls_sin.interview_type == InterviewType.PERSONAL and cls_sin.should_trigger is True
+
+    # 8. Why googling? / My Google. -> Why Google? -> PERSONAL
+    for g_phrase in ("Why googling?", "My Google."):
+        norm_g, _, _ = DomainLexicon.normalize_stt(g_phrase)
+        assert norm_g == "Why Google?", f"Expected 'Why Google?', got: {norm_g}"
+        cls_g = copilot.ISRE.classify(g_phrase)
+        assert cls_g.interview_type == InterviewType.PERSONAL and cls_g.should_trigger is True
+
+    # 9. Tell me about your internship at the Mx. -> DMX Technologies -> PROJECT, no H1 hallucination
+    mx_q = "Tell me about your internship at the Mx."
+    norm_mx, ent_mx, _ = DomainLexicon.normalize_stt(mx_q)
+    assert "DMX Technologies" in norm_mx and ent_mx == "DMX Technologies"
+    cls_mx = copilot.ISRE.classify(mx_q)
+    assert cls_mx.interview_type == InterviewType.PROJECT
+    target_mx = build_answer_target(mx_q, cls_mx)
+    dmx_ans = "During my internship at DMX Technologies, I collaborated with the team on dashboard deliverables and SQL queries."
+    audit_mx = audit_hallucinations(dmx_ans, target_mx)
+    assert audit_mx.is_clean and audit_mx.category != HallucinationCategory.H1_INVENTED_EXPERIENCE
+
+    # Contrast with unsupported manager conflict at internship
+    mgr_q = "Tell me about a time you had a conflict with your manager at your internship"
+    cls_mgr = copilot.ISRE.classify(mgr_q)
+    target_mgr = build_answer_target(mgr_q, cls_mgr)
+    fab_ans = "At my internship, my manager and I disagreed over deadlines, so I scheduled a 1-on-1 to align."
+    audit_mgr = audit_hallucinations(fab_ans, target_mgr)
+    assert not audit_mgr.is_clean and audit_mgr.category == HallucinationCategory.H1_INVENTED_EXPERIENCE
+
+    # 10. GCA trade-off misrecognition
+    gca_noisy = "yet red off. First but rough. But slow but thorough. Are you both sides in under 45 seconds total?"
+    cls_gca = copilot.ISRE.classify(gca_noisy)
+    assert cls_gca.interview_type == InterviewType.GCA, f"Expected GCA, got: {cls_gca.interview_type}"
+
+    # 11. Power VA strictly preserved
+    norm_pva, ent_pva, _ = DomainLexicon.normalize_stt("What is Power VA?")
+    assert norm_pva == "What is Power VA?" and ent_pva == "Power VA"
+    assert "Power BI" not in norm_pva
+
+    # 12. Closest question phonetic recovery & AnswerTarget.recovery_hint
+    rec_q, rec_hint = DomainLexicon.recover_closest_question("Why this roll?")
+    assert rec_q == "Why this role?" and rec_hint is not None, f"Expected 'Why this role?', got: {rec_q}, {rec_hint}"
+    near_q = "What are your strength and weakness?"
+    cls_near = copilot.ISRE.classify(near_q)
+    target_near = build_answer_target(near_q, cls_near)
+    assert target_near.recovery_hint is not None and "What are your strengths and weaknesses?" in target_near.normalized_question
+    print("  PASS: All STT misrecognitions, guards, routing, H1 audits, and closest-question recoveries verified.")
+    return True
+
+
+def _build_minimal_two_page_pdf(pdf_path: Path, page1_text: str, page2_text: str) -> None:
+    """Builds a valid 2-page PDF with extractable text streams using standard PDF syntax."""
+    def _escape_pdf_text(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    s1 = f"BT /F1 12 Tf 72 720 Td ({_escape_pdf_text(page1_text)}) Tj ET".encode("latin-1")
+    s2 = f"BT /F1 12 Tf 72 720 Td ({_escape_pdf_text(page2_text)}) Tj ET".encode("latin-1")
+
+    objs = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>\nendobj\n",
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        f"6 0 obj\n<< /Length {len(s1)} >>\nstream\n".encode("latin-1") + s1 + b"\nendstream\nendobj\n",
+        f"7 0 obj\n<< /Length {len(s2)} >>\nstream\n".encode("latin-1") + s2 + b"\nendstream\nendobj\n",
+    ]
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objs:
+        offsets.append(len(out))
+        out.extend(obj)
+    xref_pos = len(out)
+    out.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode("latin-1"))
+    for off in offsets[1:]:
+        out.extend(f"{off:010d} 00000 n \n".encode("latin-1"))
+    out.extend(
+        f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode("latin-1")
+    )
+    pdf_path.write_bytes(bytes(out))
+
+
+def test_20_stealth_document_pdf_viewer_engine():
+    print("\n--- Test 20: Stealth Document & PDF Viewer Engine ---")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        ext_dir = tmp_path / "external"
+        ext_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a 2-page PDF and a multi-section Markdown file
+        pdf_file = docs_dir / "candidate_notes.pdf"
+        _build_minimal_two_page_pdf(
+            pdf_file,
+            "Page One Alpha: Credit Risk Dashboard built with Power BI and SQL.",
+            "Page Two Beta: DMX Technologies internship collaboration and Redis caching.",
+        )
+
+        md_file = docs_dir / "interview_prep.md"
+        md_file.write_text(
+            "# Section 1 Intro\nTelemetry and latency metrics.\n## Section 2 Deep Dive\nExploratory Data Analysis and DAX measures.",
+            encoding="utf-8",
+        )
+
+        engine = copilot.DocumentViewerEngine(docs_dir=docs_dir, workspace_dir=tmp_path)
+        docs = engine.list_documents()
+        doc_names = [d.name for d in docs]
+        assert "candidate_notes.pdf" in doc_names and "interview_prep.md" in doc_names
+
+        # Load and verify 2-page PDF navigation & search
+        meta_pdf = engine.load_document(pdf_file)
+        assert meta_pdf["total_pages"] == 2
+        assert meta_pdf["page"] == 1
+        assert "Credit Risk Dashboard" in meta_pdf["content"]
+
+        p_num, p_total, p2_txt = engine.next_page()
+        assert p_num == 2 and p_total == 2 and "DMX Technologies" in p2_txt
+
+        p_num_prev, _, p1_txt = engine.prev_page()
+        assert p_num_prev == 1 and "Credit Risk Dashboard" in p1_txt
+
+        # Search across pages
+        matches = engine.search("Redis")
+        assert len(matches) == 1 and matches[0][0] == 2
+        assert engine.current_page == 1  # 0-based index for page 2
+
+        matches_both = engine.search("Page")
+        assert len(matches_both) == 2
+        next_hit = engine.next_search_match()
+        assert next_hit is not None and next_hit[0] == 2
+
+        # Load and verify Markdown pagination
+        meta_md = engine.load_document(md_file)
+        assert meta_md["total_pages"] >= 2
+        assert "Telemetry" in engine.get_page(0)[2]
+        assert "Exploratory Data Analysis" in engine.next_page()[2]
+
+        # Stealth import of external file without OS dialog
+        ext_md = ext_dir / "external_cheatsheet.md"
+        ext_md.write_text("# External Sheet\nFastAPI and Java Spring Boot notes.", encoding="utf-8")
+        imported_dest = engine.import_file(ext_md)
+        assert imported_dest.exists() and imported_dest.parent == docs_dir
+        assert "FastAPI" in engine.get_page(0)[2]
+    print("  PASS: DocumentViewerEngine PDF/MD loading, pagination, search, and dialog-free import verified.")
+    return True
+
+
+def test_21_window_stealth_cloaking_and_whisper_prompt():
+    print("\n--- Test 21: Window Stealth Cloaking & Whisper Initial Prompt ---")
+    for term in ("Power BI", "Power VA", "Redis", "FastAPI", "React", "DMX Technologies", "EDA"):
+        assert term in copilot.WHISPER_INITIAL_PROMPT, f"Missing '{term}' in WHISPER_INITIAL_PROMPT"
+
+    assert copilot.WDA_EXCLUDEFROMCAPTURE == 0x00000011
+    assert copilot.apply_window_stealth(0) is False
+    assert copilot.apply_window_stealth(None) is False
+
+    if sys.platform == "win32":
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.update_idletasks()
+            stealth_ok = copilot.apply_window_stealth(root)
+            assert stealth_ok is True, "Expected apply_window_stealth to succeed on Win32 Tk window"
+        finally:
+            root.destroy()
+    print("  PASS: WHISPER_INITIAL_PROMPT vocabulary and Win32 WDA_EXCLUDEFROMCAPTURE stealth cloaking verified.")
+    return True
+
+
 def run_all_v3_tests():
     print("===========================================================================")
     print("           INTERVIEW COPILOT V3 RELIABILITY TEST SUITE                     ")
@@ -443,6 +655,9 @@ def run_all_v3_tests():
         test_16_evaluation_datasets_runner,
         test_17_adversarial_prompt_suite,
         test_18_telemetry_preservation,
+        test_19_misheard_stt_and_closest_question_recovery,
+        test_20_stealth_document_pdf_viewer_engine,
+        test_21_window_stealth_cloaking_and_whisper_prompt,
     ]
     
     passed = 0
@@ -463,6 +678,9 @@ def run_all_v3_tests():
     print(f"V3 TEST RESULTS: {passed}/{len(tests)} PASSED (Failed: {failed})")
     print("===========================================================================")
     return failed == 0
+
+
+run_all_tests = run_all_v3_tests
 
 
 if __name__ == "__main__":
